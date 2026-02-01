@@ -3,8 +3,9 @@
 import unittest
 import torch
 from gemlite import reset_config, set_autotune
-from gemlite.core import GemLiteLinearTriton, DType, TORCH_TO_DTYPE, scale_activations, forward_functional
+from gemlite.core import GemLiteLinearTriton, DType, TORCH_TO_DTYPE, forward_functional
 from gemlite.triton_kernels.config import KERNEL
+from gemlite.quant_utils import scale_activations_per_token_torch as scale_activations
 
 def is_fp8_supported():
     if not torch.cuda.is_available():
