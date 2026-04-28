@@ -420,3 +420,53 @@ class GemliteCTW4A16Mxfp4(GemliteCTApplyMixin, CompressedTensorsW4A16Mxfp4):
             W_q_packed=weight, scales=layer.weight_scale.data, bias=None,
         )
         _ct_attach(layer, gl, ("weight_packed", "weight_scale"))
+
+
+# ---------------------------------------------------------------------------
+# compressed-tensors WNA16 int4 (pack_quantized, type=int)
+# ---------------------------------------------------------------------------
+
+_CT_WNA16_CLEANUP = ("weight_packed", "weight_scale", "weight_zero_point",
+                     "weight_shape", "weight_g_idx")
+
+
+class GemliteCTWNA16Int(GemliteCTApplyMixin,
+                       __import__("vllm.model_executor.layers.quantization."
+                                  "compressed_tensors.schemes",
+                                  fromlist=["CompressedTensorsWNA16"])
+                       .CompressedTensorsWNA16):
+    """CT pack_quantized W4A16 int -> gemlite A16W4_HQQ_INT.
+
+    Expects layer.weight_packed [N, K//8] int32, layer.weight_scale [N, K/gs]
+    and (asym) layer.weight_zero_point [N//8, K/gs] int32. No g_idx path here
+    (caller should route to stock vLLM if actorder == 'group')."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        weight_packed = layer.weight_packed.data
+        scales = layer.weight_scale.data
+
+        # Unpack [N, K//8] int32 -> [N, K] uint8 along packed dim=1.
+        W_q_nk = unpack_int32(weight_packed, bits=4, pack_dim=1)
+        N, K = W_q_nk.shape
+
+        group_size = self.group_size if self.group_size != -1 else K
+        G = K // group_size
+        assert scales.shape == (N, G), (
+            f"scales shape {tuple(scales.shape)} != [N={N}, G={G}]"
+        )
+
+        if self.symmetric:
+            zeros = torch.full((N, G), 8, dtype=scales.dtype, device=scales.device)
+        else:
+            qzeros_packed = layer.weight_zero_point.data   # [N//8, G] int32
+            # Unpack along packed dim=0 -> [N, G] uint8; cast to scales dtype.
+            zeros = unpack_int32(qzeros_packed, bits=4, pack_dim=0).to(scales.dtype)
+            assert zeros.shape == (N, G), zeros.shape
+
+        dtype = getattr(layer, "params_dtype", scales.dtype)
+        gl = A16W4_HQQ_INT(
+            device=weight_packed.device, dtype=dtype,
+        ).from_weights(W_q=W_q_nk, scales=scales, zeros=zeros, bias=None)
+
+        _ct_attach(layer, gl, _CT_WNA16_CLEANUP)
+

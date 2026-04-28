@@ -33,7 +33,7 @@ from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 from .common import load_cache
 from .schemes import (
     GemliteAwqLinearMethod, GemliteCTW4A4Fp4, GemliteCTW4A16Fp4,
-    GemliteCTW4A16Mxfp4, GemliteFp8BlockLinearMethod,
+    GemliteCTW4A16Mxfp4, GemliteCTWNA16Int, GemliteFp8BlockLinearMethod,
     GemliteFp8PerTensorLinearMethod, GemliteA16W4GroupLinearMethod,
     GemliteNvFp4LinearMethod,
 )
@@ -136,6 +136,26 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
                 and self._is_nvfp4_format(input_quant)
                 and _enabled("A4W4_NVFP_DYNAMIC")):
             return GemliteCTW4A4Fp4()
+
+        # CT pack_quantized WNA16 int4/int8 (weight-only, type=int, group/channel)
+        # without actorder. Share the A16W4_HQQ_INT toggle with GPTQ/AWQ.
+        if (_enabled("A16W4_HQQ_INT")
+                and input_quant is None
+                and getattr(weight_quant, "type", None) == "int"
+                and weight_quant.num_bits == 4
+                and weight_quant.strategy in ("group", "channel")
+                and not weight_quant.dynamic
+                and getattr(weight_quant, "actorder", None) in (None, "static")):
+            _fmt = format if format else self.quant_format
+            if _fmt == "pack-quantized":
+                return GemliteCTWNA16Int(
+                    num_bits=weight_quant.num_bits,
+                    strategy=weight_quant.strategy,
+                    symmetric=weight_quant.symmetric,
+                    group_size=weight_quant.group_size,
+                    actorder=weight_quant.actorder,
+                    layer_name=layer_name,
+                )
 
         return super()._get_scheme_from_parts(
             weight_quant, input_quant, format=format, layer_name=layer_name,
@@ -268,7 +288,8 @@ def _build_overrides() -> dict[str, type]:
         o["fp8"] = GemliteFp8Config
     if _ENABLED & {"A4W4_NVFP_DYNAMIC"}:
         o["modelopt_fp4"] = GemliteModelOptNvFp4Config
-    if _ENABLED & {"A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC", "A16W4_MXFP"}:
+    if _ENABLED & {"A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC",
+                   "A16W4_MXFP", "A16W4_HQQ_INT"}:
         o["compressed-tensors"] = GemliteCompressedTensorsConfig
     if _ENABLED & {"A16W4_HQQ_INT"}:
         o["gptq"] = GemliteGptqConfig
