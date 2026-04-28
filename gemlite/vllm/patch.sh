@@ -2,7 +2,7 @@
 # Install/uninstall the gemlite autopatch hook in vllm/engine/__init__.py.
 # Needed for use with async engines that fork worker processes — those
 # subprocesses re-import vllm, and this hook makes every re-import run
-# gemlite.vllm.patch.patch_vllm() which reads env vars.
+# gemlite.vllm.patch_vllm() which reads env vars.
 #
 # Usage:
 #   bash patch.sh install [--vllm-engine-init /path/to/vllm/engine/__init__.py]
@@ -44,7 +44,7 @@ if _os.environ.get("VLLM_GEMLITE_ENABLE", "0") != "0" or _os.environ.get(
     "VLLM_GEMLITE_ONTHEFLY_QUANT"
 ):
     try:
-        from gemlite.vllm.patch import patch_vllm as _patch_vllm
+        from gemlite.vllm import patch_vllm as _patch_vllm
         _patch_vllm()
     except Exception as _e:
         import logging as _logging

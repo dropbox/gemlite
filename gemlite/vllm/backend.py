@@ -43,17 +43,17 @@ logger = logging.getLogger(__name__)
 
 
 SUPPORTED = {
-    "A8W8_fp8_dynamic",     # FP8 dynamic (block + per-tensor/channel)
+    "A8W8_FP8_DYNAMIC",     # FP8 dynamic (block + per-tensor/channel)
     "A16W8_FP8",            # FP8 weight-only per-channel
     "A16W8_INT8",           # INT8 weight-only
-    "A8W8_INT8_dynamic",    # INT8 dynamic
-    "A4W4_NVFP_dynamic",    # NVFP4 (ModelOpt + compressed-tensors)
-    "A4W4_MXFP_dynamic",    # MXFP4 dynamic
+    "A8W8_INT8_DYNAMIC",    # INT8 dynamic
+    "A4W4_NVFP_DYNAMIC",    # NVFP4 (ModelOpt + compressed-tensors)
+    "A4W4_MXFP_DYNAMIC",    # MXFP4 dynamic
     "A16W4_MXFP",           # MXFP4 weight-only
     "A16W4_HQQ_INT",        # HQQ/GPTQ/GPTQMarlin int4 weight-only
-    "A16W4_AWQ",            # AWQ / AWQMarlin int4 weight-only
 }
 
+_ALIASES = {"A16W4_INT": "A16W4_HQQ_INT"}
 _PATCHED = False
 _ENABLED: set[str] = set()
 
@@ -83,7 +83,7 @@ class GemliteFp8Config(Fp8Config):
             return method
         if not self.is_checkpoint_fp8_serialized:
             return method
-        if self._block_ok() and _enabled("A8W8_fp8_dynamic"):
+        if self._block_ok() and _enabled("A8W8_FP8_DYNAMIC"):
             return GemliteFp8BlockLinearMethod(self)
         if (self.weight_block_size is None
                 and self.activation_scheme == "dynamic"
@@ -104,7 +104,7 @@ class GemliteModelOptNvFp4Config(ModelOptNvFp4Config):
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
         if (isinstance(method, ModelOptNvFp4LinearMethod)
-                and _enabled("A4W4_NVFP_dynamic")):
+                and _enabled("A4W4_NVFP_DYNAMIC")):
             return GemliteNvFp4LinearMethod(self, method)
         return method
 
@@ -117,7 +117,7 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
     def _get_scheme_from_parts(self, weight_quant, input_quant,
                                format=None, layer_name=None):
         if self._is_nvfp4_format(weight_quant) and input_quant is None:
-            if _enabled("A16W4_MXFP") or _enabled("A4W4_NVFP_dynamic"):
+            if _enabled("A16W4_MXFP") or _enabled("A4W4_NVFP_DYNAMIC"):
                 return GemliteCTW4A16Fp4()
         if self._is_mxfp4(weight_quant) and _enabled("A16W4_MXFP"):
             return GemliteCTW4A16Mxfp4()
@@ -134,7 +134,7 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
         if (act_fmt
                 and self._is_nvfp4_format(weight_quant)
                 and self._is_nvfp4_format(input_quant)
-                and _enabled("A4W4_NVFP_dynamic")):
+                and _enabled("A4W4_NVFP_DYNAMIC")):
             return GemliteCTW4A4Fp4()
 
         return super()._get_scheme_from_parts(
@@ -147,8 +147,9 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
 # ---------------------------------------------------------------------------
 
 def _a16w4_ok(weight_bits: int, desc_act: bool = False) -> bool:
-    # gemlite A16W4 path assumes no activation reordering.
-    return weight_bits == 4 and not desc_act
+    # desc_act=True is handled by baking argsort(g_idx) into the weight
+    # layout at load time; see GemliteA16W4GroupLinearMethod.
+    return weight_bits == 4
 
 
 def _gemlite_gptq_method(cfg, stock, is_v1):
@@ -212,7 +213,7 @@ class GemliteAwqConfig(AWQConfig):
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
         if (isinstance(method, AWQLinearMethod)
-                and _enabled("A16W4_AWQ") and self.weight_bits == 4):
+                and _enabled("A16W4_HQQ_INT") and self.weight_bits == 4):
             return _gemlite_awq_method(self, method)
         return method
 
@@ -225,7 +226,7 @@ class GemliteAwqMarlinConfig(AWQMarlinConfig):
         return "awq_marlin"
 
     def get_quant_method(self, layer, prefix):
-        if (_enabled("A16W4_AWQ") and isinstance(layer, LinearBase)
+        if (_enabled("A16W4_HQQ_INT") and isinstance(layer, LinearBase)
                 and self.weight_bits == 4):
             stock = AWQLinearMethod(AWQConfig(
                 weight_bits=self.weight_bits, group_size=self.group_size,
@@ -263,16 +264,15 @@ def _register_v2_methods() -> None:
 
 def _build_overrides() -> dict[str, type]:
     o: dict[str, type] = {}
-    if _ENABLED & {"A8W8_fp8_dynamic", "A16W8_FP8"}:
+    if _ENABLED & {"A8W8_FP8_DYNAMIC", "A16W8_FP8"}:
         o["fp8"] = GemliteFp8Config
-    if _ENABLED & {"A4W4_NVFP_dynamic"}:
+    if _ENABLED & {"A4W4_NVFP_DYNAMIC"}:
         o["modelopt_fp4"] = GemliteModelOptNvFp4Config
-    if _ENABLED & {"A4W4_NVFP_dynamic", "A4W4_MXFP_dynamic", "A16W4_MXFP"}:
+    if _ENABLED & {"A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC", "A16W4_MXFP"}:
         o["compressed-tensors"] = GemliteCompressedTensorsConfig
     if _ENABLED & {"A16W4_HQQ_INT"}:
         o["gptq"] = GemliteGptqConfig
         o["gptq_marlin"] = GemliteGptqMarlinConfig
-    if _ENABLED & {"A16W4_AWQ"}:
         o["awq"] = GemliteAwqConfig
         o["awq_marlin"] = GemliteAwqMarlinConfig
     return o
@@ -285,6 +285,7 @@ def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
     import vllm.model_executor.layers.quantization as _vq
 
     requested = set(names) if names is not None else set(SUPPORTED)
+    requested = {_ALIASES.get(n, n) for n in requested}
     unknown = requested - SUPPORTED
     if unknown:
         raise ValueError(

@@ -206,6 +206,22 @@ def _normalize_zeros(qzeros, *, bits, packed_dim, N, G, out_dtype,
     )
 
 
+def _gptq_perm_from_g_idx(g_idx, K, group_size):
+    """Return a [K] int64 permutation that sorts g_idx so input columns
+    belonging to the same GPTQ group are contiguous. Returns None if g_idx
+    is missing or already trivial (k//group_size)."""
+    if g_idx is None:
+        return None
+    g = g_idx.data if hasattr(g_idx, "data") else g_idx
+    if not isinstance(g, torch.Tensor) or g.numel() != K:
+        return None
+    g = g.to(torch.int64)
+    trivial = torch.arange(K, device=g.device, dtype=torch.int64) // group_size
+    if torch.equal(g, trivial):
+        return None
+    return torch.argsort(g, stable=True)
+
+
 class GemliteA16W4GroupLinearMethod(StockWrappedGemliteMethod):
     """HQQ / GPTQ int4 weight-only via A16W4_HQQ_INT."""
 
@@ -219,6 +235,13 @@ class GemliteA16W4GroupLinearMethod(StockWrappedGemliteMethod):
         self.qzeros_pack_dim = qzeros_pack_dim
         self.gptq_v1_plus_one = gptq_v1_plus_one
 
+    def apply(self, layer, x, bias=None):
+        perm = getattr(layer, "gemlite_act_perm", None)
+        if perm is not None:
+            x = x.index_select(-1, perm)
+        out = layer.gemlite_linear(x)
+        return out if bias is None else out + bias
+
     def process_weights_after_loading(self, layer) -> None:
         qweight = layer.qweight.data
         scales = layer.scales.data
@@ -226,12 +249,25 @@ class GemliteA16W4GroupLinearMethod(StockWrappedGemliteMethod):
         W_q_kn = unpack_int32(qweight, self.weight_bits,
                               pack_dim=self.qweight_pack_dim)
         K, N = W_q_kn.shape
-        W_q = W_q_kn.t().contiguous()
 
         group_size = getattr(self.quant_config, "group_size", -1) or -1
         if group_size == -1:
             group_size = K
         G = K // group_size
+
+        # GPTQ desc_act=True: columns (input features) are re-ordered across
+        # quant groups. Sort rows of unpacked W_q by argsort(g_idx) so groups
+        # become contiguous; each HQQ group of `group_size` rows now comes
+        # from a single GPTQ group and shares scales[n,g]/zeros[n,g] exactly.
+        # No re-quantization. apply() gathers x by the same perm to keep the
+        # math equivalent to the original GPTQ forward.
+        perm = _gptq_perm_from_g_idx(
+            getattr(layer, "g_idx", None), K=K, group_size=group_size,
+        )
+        if perm is not None:
+            W_q_kn = W_q_kn.index_select(0, perm).contiguous()
+
+        W_q = W_q_kn.t().contiguous()
 
         scales_ng = scales.t().contiguous()
         zeros = _normalize_zeros(
@@ -248,6 +284,8 @@ class GemliteA16W4GroupLinearMethod(StockWrappedGemliteMethod):
         ).from_weights(W_q=W_q, scales=scales_ng, zeros=zeros, bias=None)
 
         self._finalize(layer, gl)
+        if perm is not None:
+            layer.gemlite_act_perm = perm.to(torch.int32)
         clear_layer_attrs(layer, _INT4_CLEANUP)
 
 
