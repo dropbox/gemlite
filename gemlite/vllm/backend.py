@@ -51,9 +51,10 @@ SUPPORTED = {
     "A4W4_MXFP_DYNAMIC",    # MXFP4 dynamic
     "A16W4_MXFP",           # MXFP4 weight-only
     "A16W4_HQQ_INT",        # HQQ/GPTQ/GPTQMarlin int4 weight-only
+    "A16W8_HQQ_INT",        # HQQ/GPTQ/GPTQMarlin int8 weight-only
 }
 
-_ALIASES = {"A16W4_INT": "A16W4_HQQ_INT"}
+_ALIASES = {"A16W4_INT": "A16W4_HQQ_INT", "A16W8_INT": "A16W8_HQQ_INT"}
 _PATCHED = False
 _ENABLED: set[str] = set()
 
@@ -139,13 +140,13 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
 
         # CT pack_quantized WNA16 int4/int8 (weight-only, type=int, group/channel)
         # without actorder. Share the A16W4_HQQ_INT toggle with GPTQ/AWQ.
-        if (_enabled("A16W4_HQQ_INT")
-                and input_quant is None
+        if (input_quant is None
                 and getattr(weight_quant, "type", None) == "int"
-                and weight_quant.num_bits == 4
+                and weight_quant.num_bits in (4, 8)
                 and weight_quant.strategy in ("group", "channel")
                 and not weight_quant.dynamic
-                and getattr(weight_quant, "actorder", None) in (None, "static")):
+                and getattr(weight_quant, "actorder", None) in (None, "static")
+                and _enabled(_a16wn_toggle(weight_quant.num_bits))):
             _fmt = format if format else self.quant_format
             if _fmt == "pack-quantized":
                 return GemliteCTWNA16Int(
@@ -166,15 +167,21 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
 # GPTQ + AWQ (and their marlin auto-upgrades)
 # ---------------------------------------------------------------------------
 
-def _a16w4_ok(weight_bits: int, desc_act: bool = False) -> bool:
-    # desc_act=True is handled by baking argsort(g_idx) into the weight
-    # layout at load time; see GemliteA16W4GroupLinearMethod.
-    return weight_bits == 4
+def _a16wn_ok(weight_bits: int, desc_act: bool = False) -> bool:
+    # 4-bit and 8-bit INT weight-only share the same scheme class;
+    # desc_act=True uses the argsort(g_idx) reshuffle at load time.
+    return weight_bits in (4, 8)
+
+
+def _a16wn_toggle(weight_bits: int) -> str:
+    return {4: "A16W4_HQQ_INT", 8: "A16W8_HQQ_INT"}[weight_bits]
+
+
 
 
 def _gemlite_gptq_method(cfg, stock, is_v1):
     return GemliteA16W4GroupLinearMethod(
-        cfg, stock, weight_bits=4,
+        cfg, stock, weight_bits=cfg.weight_bits,
         qweight_pack_dim=0, qzeros_pack_dim=1,
         gptq_v1_plus_one=is_v1,
     )
@@ -182,7 +189,7 @@ def _gemlite_gptq_method(cfg, stock, is_v1):
 
 def _gemlite_awq_method(cfg, stock):
     return GemliteAwqLinearMethod(
-        cfg, stock, weight_bits=4, zero_point=cfg.zero_point,
+        cfg, stock, weight_bits=cfg.weight_bits, zero_point=cfg.zero_point,
     )
 
 
@@ -194,8 +201,8 @@ class GemliteGptqConfig(GPTQConfig):
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
         if (isinstance(method, GPTQLinearMethod)
-                and _enabled("A16W4_HQQ_INT")
-                and _a16w4_ok(self.weight_bits, self.desc_act)):
+                and _a16wn_ok(self.weight_bits, self.desc_act)
+                and _enabled(_a16wn_toggle(self.weight_bits))):
             is_v1 = getattr(self, "checkpoint_format", "") != "gptq_v2"
             return _gemlite_gptq_method(self, method, is_v1)
         return method
@@ -209,8 +216,9 @@ class GemliteGptqMarlinConfig(GPTQMarlinConfig):
         return "gptq_marlin"
 
     def get_quant_method(self, layer, prefix):
-        if (_enabled("A16W4_HQQ_INT") and isinstance(layer, LinearBase)
-                and _a16w4_ok(self.weight_bits, self.desc_act)
+        if (_a16wn_ok(self.weight_bits, self.desc_act)
+                and _enabled(_a16wn_toggle(self.weight_bits))
+                and isinstance(layer, LinearBase)
                 and self.is_sym):
             stock = GPTQLinearMethod(GPTQConfig(
                 weight_bits=self.weight_bits, group_size=self.group_size,
@@ -233,7 +241,8 @@ class GemliteAwqConfig(AWQConfig):
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
         if (isinstance(method, AWQLinearMethod)
-                and _enabled("A16W4_HQQ_INT") and self.weight_bits == 4):
+                and _a16wn_ok(self.weight_bits)
+                and _enabled(_a16wn_toggle(self.weight_bits))):
             return _gemlite_awq_method(self, method)
         return method
 
@@ -246,8 +255,9 @@ class GemliteAwqMarlinConfig(AWQMarlinConfig):
         return "awq_marlin"
 
     def get_quant_method(self, layer, prefix):
-        if (_enabled("A16W4_HQQ_INT") and isinstance(layer, LinearBase)
-                and self.weight_bits == 4):
+        if (_a16wn_ok(self.weight_bits)
+                and _enabled(_a16wn_toggle(self.weight_bits))
+                and isinstance(layer, LinearBase)):
             stock = AWQLinearMethod(AWQConfig(
                 weight_bits=self.weight_bits, group_size=self.group_size,
                 zero_point=self.zero_point,
@@ -289,9 +299,9 @@ def _build_overrides() -> dict[str, type]:
     if _ENABLED & {"A4W4_NVFP_DYNAMIC"}:
         o["modelopt_fp4"] = GemliteModelOptNvFp4Config
     if _ENABLED & {"A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC",
-                   "A16W4_MXFP", "A16W4_HQQ_INT"}:
+                   "A16W4_MXFP", "A16W4_HQQ_INT", "A16W8_HQQ_INT"}:
         o["compressed-tensors"] = GemliteCompressedTensorsConfig
-    if _ENABLED & {"A16W4_HQQ_INT"}:
+    if _ENABLED & {"A16W4_HQQ_INT", "A16W8_HQQ_INT"}:
         o["gptq"] = GemliteGptqConfig
         o["gptq_marlin"] = GemliteGptqMarlinConfig
         o["awq"] = GemliteAwqConfig

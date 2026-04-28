@@ -9,7 +9,7 @@ import torch
 
 from gemlite.helper import (
     A4W4_NVFP_dynamic, A8W8_fp8_dynamic, A8W8_int8_dynamic,
-    A16W4_HQQ_INT, A16W4_MXFP, A16W4_NVFP, A16W8_INT8,
+    A16W4_HQQ_INT, A16W4_MXFP, A16W4_NVFP, A16W8_HQQ_INT, A16W8_INT8,
 )
 from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 
@@ -229,7 +229,7 @@ class GemliteA16W4GroupLinearMethod(StockWrappedGemliteMethod):
                  weight_bits=4, qweight_pack_dim=0, qzeros_pack_dim=1,
                  gptq_v1_plus_one=True):
         super().__init__(quant_config, stock_method)
-        assert weight_bits == 4, "A16W4 path is 4-bit only."
+        assert weight_bits in (4, 8), f"A16W{weight_bits} unsupported; want 4 or 8."
         self.weight_bits = weight_bits
         self.qweight_pack_dim = qweight_pack_dim
         self.qzeros_pack_dim = qzeros_pack_dim
@@ -279,7 +279,8 @@ class GemliteA16W4GroupLinearMethod(StockWrappedGemliteMethod):
         if zeros is None:
             zeros = torch.zeros_like(scales_ng)
 
-        gl = A16W4_HQQ_INT(
+        HelperCls = A16W4_HQQ_INT if self.weight_bits == 4 else A16W8_HQQ_INT
+        gl = HelperCls(
             device=qweight.device, dtype=scales.dtype,
         ).from_weights(W_q=W_q, scales=scales_ng, zeros=zeros, bias=None)
 
@@ -315,7 +316,7 @@ class GemliteAwqLinearMethod(StockWrappedGemliteMethod):
     def __init__(self, quant_config, stock_method,
                  weight_bits=4, zero_point=True):
         super().__init__(quant_config, stock_method)
-        assert weight_bits == 4, "AWQ path is 4-bit only."
+        assert weight_bits in (4, 8), f"AWQ A16W{weight_bits} unsupported; want 4 or 8."
         self.weight_bits = weight_bits
         self.zero_point = zero_point
 
@@ -343,7 +344,8 @@ class GemliteAwqLinearMethod(StockWrappedGemliteMethod):
         else:
             zeros = torch.zeros_like(scales_ng)
 
-        gl = A16W4_HQQ_INT(
+        HelperCls = A16W4_HQQ_INT if self.weight_bits == 4 else A16W8_HQQ_INT
+        gl = HelperCls(
             device=qweight.device, dtype=scales.dtype,
         ).from_weights(W_q=W_q, scales=scales_ng, zeros=zeros, bias=None)
 
@@ -446,7 +448,7 @@ class GemliteCTWNA16Int(GemliteCTApplyMixin,
         scales = layer.weight_scale.data
 
         # Unpack [N, K//8] int32 -> [N, K] uint8 along packed dim=1.
-        W_q_nk = unpack_int32(weight_packed, bits=4, pack_dim=1)
+        W_q_nk = unpack_int32(weight_packed, bits=self.num_bits, pack_dim=1)
         N, K = W_q_nk.shape
 
         group_size = self.group_size if self.group_size != -1 else K
@@ -456,15 +458,16 @@ class GemliteCTWNA16Int(GemliteCTApplyMixin,
         )
 
         if self.symmetric:
-            zeros = torch.full((N, G), 8, dtype=scales.dtype, device=scales.device)
+            zeros = torch.full((N, G), 1 << (self.num_bits - 1), dtype=scales.dtype, device=scales.device)
         else:
             qzeros_packed = layer.weight_zero_point.data   # [N//8, G] int32
             # Unpack along packed dim=0 -> [N, G] uint8; cast to scales dtype.
-            zeros = unpack_int32(qzeros_packed, bits=4, pack_dim=0).to(scales.dtype)
+            zeros = unpack_int32(qzeros_packed, bits=self.num_bits, pack_dim=0).to(scales.dtype)
             assert zeros.shape == (N, G), zeros.shape
 
         dtype = getattr(layer, "params_dtype", scales.dtype)
-        gl = A16W4_HQQ_INT(
+        HelperCls = A16W4_HQQ_INT if self.num_bits == 4 else A16W8_HQQ_INT
+        gl = HelperCls(
             device=weight_packed.device, dtype=dtype,
         ).from_weights(W_q=W_q_nk, scales=scales, zeros=zeros, bias=None)
 
