@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """All gemlite LinearMethod schemes: FP8 block / per-tensor, NVFP4,
-MXFP4, INT8 (A16W8, A8W8), A16W4 GPTQ/HQQ, A16W4 AWQ, and the
-compressed-tensors wrappers for NVFP4/MXFP4."""
+MXFP4, INT8 (A16W8, A8W8), A16W4 GPTQ/HQQ, A16W4 AWQ, GGUF (Q4_0/Q4_1/Q8_0),
+and the compressed-tensors wrappers for NVFP4/MXFP4."""
 
 from __future__ import annotations
+
+import logging
 
 import torch
 
@@ -18,11 +20,14 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Mxfp4,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.gguf import GGUFLinearMethod
 
 from .common import (
     GemliteApplyMixin, GemliteCTApplyMixin, StockWrappedGemliteMethod,
     clear_layer_attrs, save_cache,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _scalar_max_fp32(t):
@@ -472,4 +477,126 @@ class GemliteCTWNA16Int(GemliteCTApplyMixin,
         ).from_weights(W_q=W_q_nk, scales=scales, zeros=zeros, bias=None)
 
         _ct_attach(layer, gl, _CT_WNA16_CLEANUP)
+
+
+# ---------------------------------------------------------------------------
+# GGUF (Q4_0 / Q4_1 / Q8_0 -> A16W4_HQQ_INT / A16W8_HQQ_INT)
+# ---------------------------------------------------------------------------
+
+_GGUF_CLEANUP = ("qweight", "qweight_type")
+
+
+class GemliteGGUFLinearMethod(GemliteApplyMixin, GGUFLinearMethod):
+    """GGUF weight-only via A16W{4,8}_HQQ_INT for supported block types.
+
+    Inherits create_weights from vLLM's GGUFLinearMethod, runs the stock
+    padded-weight materialization, then decodes each shard of the padded
+    qweight into (W_q, scales, zeros) and attaches a GemLiteLinear. apply()
+    always routes through gemlite_linear (via GemliteApplyMixin) — we never
+    fall back at forward time, so torch.compile doesn't trace stock's
+    ggml_mul_mat_a8 path (which breaks when we clear qweight). If a layer
+    can't be decoded we raise; the caller in vLLM will surface it."""
+
+    def process_weights_after_loading(self, layer):
+        # Stock GGUFLinearMethod.process_weights_after_loading() pads shards
+        # across N, sets up layer.qweight.shard_offset_map / shard_weight_type,
+        # and re-registers layer.qweight as a real Parameter. We need all of
+        # that before decoding.
+        super().process_weights_after_loading(layer)
+
+        prefix = getattr(layer, "prefix", "") or layer.__class__.__name__
+
+        try:
+            gl = self._build_gemlite(layer)
+        except Exception as e:
+            logger.warning(
+                "Failed to use gemlite at %s (%s: %s), reverting to stock GGUF",
+                prefix, type(e).__name__, e,
+            )
+            # Fallback: re-install stock apply for this layer only, so future
+            # forward passes (and torch.compile tracing) skip gemlite.
+            layer.quant_method = GGUFLinearMethod(self.quant_config)
+            return
+
+        if gl is None:
+            # Unsupported ggml type — same fallback as above.
+            logger.warning(
+                "Unsupported GGUF ggml_type at %s, reverting to stock GGUF", prefix,
+            )
+            layer.quant_method = GGUFLinearMethod(self.quant_config)
+            return
+
+        logger.warning("gemlite GGUF attached at %s", prefix)
+        layer.gemlite_linear = gl
+        # NOTE: do NOT clear layer.qweight / layer.qweight_type here.
+        # Unlike AWQ/GPTQ (where clear_layer_attrs works), GGUF's qweight is
+        # registered as a Parameter that torch.compile's AOT pipeline captures
+        # as a graph input when tracing the embedding layer. Setting it to
+        # None triggers `copy_misaligned_inputs` -> AssertionError "Expected
+        # tensors only, but got NoneType" during profile_run. Keeping the
+        # real GGUF bytes around costs ~weight_size extra VRAM until model
+        # init completes; gemlite still owns the forward path via apply().
+        torch.cuda.empty_cache()
+        save_cache()
+
+    def _build_gemlite(self, layer):
+        from .gguf_loader import _decoders, decode, supported_ggml_types
+
+        qweight = layer.qweight
+        qw_type = layer.qweight_type
+        supported = supported_ggml_types()
+
+        # Collect (ggml_type, blob [N_i, bytes_i]) per shard. For fused
+        # qkv/gate_up layers the padded qweight holds each shard row-stacked
+        # (in load order) with dim-1 padded to max bytes; shard_offset_map
+        # gives each shard's real row range and real byte width. Iteration
+        # order must match stock apply(): q/k/v canonicalized for QKV, else
+        # shard_id order.
+        shard_offset_map = getattr(qweight, "shard_offset_map", None)
+        if shard_offset_map:
+            shard_ids = list(qweight.shard_id)
+            if "q" in shard_ids:
+                shard_ids = ["q", "k", "v"]
+            shards = []
+            for idx in shard_ids:
+                start, end, bytes_i = shard_offset_map[idx]
+                shards.append((
+                    int(qw_type.shard_weight_type[idx]),
+                    qweight.data[start:end, :bytes_i].contiguous(),
+                ))
+        else:
+            shards = [(int(qw_type.weight_type), qweight.data.contiguous())]
+
+        if any(t not in supported for t, _ in shards):
+            return None
+
+        decoders = _decoders()
+        nbits_set = {decoders[t][0] for t, _ in shards}
+        if len(nbits_set) != 1:
+            return None  # mixed 4-bit + 8-bit shards: fall back
+        nbits = nbits_set.pop()
+
+        # K is shared across shards (input dim). tensor_shape is
+        # (out_total, in_per_partition) set in create_weights.
+        K = qweight.tensor_shape[1] if hasattr(qweight, "tensor_shape") else None
+        if K is None:
+            return None
+
+        dtype = getattr(self, "params_dtype", None) or torch.float16
+
+        W_q_parts, scales_parts, zeros_parts = [], [], []
+        for t, blob in shards:
+            W_q_i, scales_i, zeros_i, _ = decode(t, blob, K, dtype=dtype)
+            W_q_parts.append(W_q_i)
+            scales_parts.append(scales_i)
+            zeros_parts.append(zeros_i)
+
+        W_q = torch.cat(W_q_parts, dim=0).contiguous()
+        scales = torch.cat(scales_parts, dim=0).contiguous()
+        zeros = torch.cat(zeros_parts, dim=0).contiguous()
+
+        HelperCls = A16W4_HQQ_INT if nbits == 4 else A16W8_HQQ_INT
+        return HelperCls(
+            device=W_q.device, dtype=dtype,
+        ).from_weights(W_q=W_q, scales=scales, zeros=zeros, bias=None)
 

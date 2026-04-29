@@ -20,6 +20,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsConfig,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from vllm.model_executor.layers.quantization.gguf import (
+    GGUFConfig, GGUFLinearMethod,
+)
 from vllm.model_executor.layers.quantization.gptq import (
     GPTQConfig, GPTQLinearMethod,
 )
@@ -35,7 +38,7 @@ from .schemes import (
     GemliteAwqLinearMethod, GemliteCTW4A4Fp4, GemliteCTW4A16Fp4,
     GemliteCTW4A16Mxfp4, GemliteCTWNA16Int, GemliteFp8BlockLinearMethod,
     GemliteFp8PerTensorLinearMethod, GemliteA16W4GroupLinearMethod,
-    GemliteNvFp4LinearMethod,
+    GemliteGGUFLinearMethod, GemliteNvFp4LinearMethod,
 )
 
 
@@ -268,6 +271,29 @@ class GemliteAwqMarlinConfig(AWQMarlinConfig):
 
 
 # ---------------------------------------------------------------------------
+# GGUF
+# ---------------------------------------------------------------------------
+
+class GemliteGGUFConfig(GGUFConfig):
+    """Wrap stock GGUFLinearMethod with GemliteGGUFLinearMethod for supported
+    affine block types (Q4_0/Q4_1 -> A16W4_HQQ_INT, Q8_0 -> A16W8_HQQ_INT).
+    Unsupported types (K-quants, I-quants, MoE, embedding) fall through to
+    stock."""
+
+    @classmethod
+    def get_name(cls):
+        return "gguf"
+
+    def get_quant_method(self, layer, prefix):
+        method = super().get_quant_method(layer, prefix)
+        if (isinstance(method, GGUFLinearMethod)
+                and type(method) is GGUFLinearMethod
+                and (_enabled("A16W4_HQQ_INT") or _enabled("A16W8_HQQ_INT"))):
+            return GemliteGGUFLinearMethod(self)
+        return method
+
+
+# ---------------------------------------------------------------------------
 # enable_gemlite
 # ---------------------------------------------------------------------------
 
@@ -279,6 +305,9 @@ _V2_SUPPORTED_METHODS = (
     "GemliteAwqLinearMethod",
     "GemliteA16W8Int8LinearMethod",
     "GemliteA8W8Int8DynamicLinearMethod",
+    # GGUF uses the legacy weight loader (shard_id / data_container) — keep it
+    # off the v2 list or fused qkv/gate_up loading routes to load_qkv_weight
+    # which isn't set up on plain UninitializedParameters.
 )
 
 
@@ -306,6 +335,7 @@ def _build_overrides() -> dict[str, type]:
         o["gptq_marlin"] = GemliteGptqMarlinConfig
         o["awq"] = GemliteAwqConfig
         o["awq_marlin"] = GemliteAwqMarlinConfig
+        o["gguf"] = GemliteGGUFConfig
     return o
 
 
@@ -337,6 +367,20 @@ def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
             return overrides.get(quantization) or orig(quantization)
 
         _vq.get_quantization_config = _patched
+        # Other modules do `from ...quantization import get_quantization_config`,
+        # which captures the original function as a local name. Patch those
+        # bindings too or they'll keep returning the stock classes.
+        for modname in (
+            "vllm.model_executor.model_loader.weight_utils",
+            "vllm.model_executor.models.llama4_eagle",
+            "vllm.model_executor.models.mistral_large_3_eagle",
+        ):
+            try:
+                _mod = __import__(modname, fromlist=["get_quantization_config"])
+            except Exception:
+                continue
+            if getattr(_mod, "get_quantization_config", None) is orig:
+                _mod.get_quantization_config = _patched
         _PATCHED = True
 
     registry = getattr(_vq, "QUANTIZATION_METHODS", None)
