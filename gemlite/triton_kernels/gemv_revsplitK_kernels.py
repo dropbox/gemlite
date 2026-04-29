@@ -241,7 +241,7 @@ else:
     configs=get_autotune_config(),
     key = KEYS,
     restore_value = ['a_ptr', 'b_ptr', 'c_ptr'],
-    prune_configs_by = {'early_config_prune': kernel_config_pruner},
+    prune_configs_by = {'early_config_prune': lambda _c, _n, **_kw: list(kernel_config_pruner(_c, _n, **_kw))},
     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
 )
 
