@@ -469,3 +469,14 @@ def register() -> None:
         patch_vllm()
     except Exception as e:
         logger.warning("gemlite plugin register() failed: %s", e)
+
+
+# v1 spawn children don't run the engine/__init__ autopatch; re-run here so
+# _ENABLED is populated when a Gemlite*Config unpickles and imports us.
+if os.environ.get("VLLM_GEMLITE_ENABLE", "0") != "0" or os.environ.get(
+    "VLLM_GEMLITE_ONTHEFLY_QUANT"
+):
+    try:
+        patch_vllm()
+    except Exception as _e:
+        logger.warning("gemlite backend import-time autopatch failed: %s", _e)

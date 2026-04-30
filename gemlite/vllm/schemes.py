@@ -448,6 +448,10 @@ class GemliteCTWNA16Int(GemliteCTApplyMixin,
     and (asym) layer.weight_zero_point [N//8, K/gs] int32. No g_idx path here
     (caller should route to stock vLLM if actorder == 'group')."""
 
+    def __init__(self, num_bits: int, *args, **kwargs) -> None:
+        super().__init__(num_bits=num_bits, *args, **kwargs)
+        self.num_bits = num_bits  # parent takes num_bits as arg but doesn't store it
+
     def process_weights_after_loading(self, layer) -> None:
         weight_packed = layer.weight_packed.data
         scales = layer.weight_scale.data
