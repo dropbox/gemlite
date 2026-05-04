@@ -53,6 +53,7 @@ SUPPORTED = {
     "A4W4_NVFP_DYNAMIC",    # NVFP4 (ModelOpt + compressed-tensors)
     "A4W4_MXFP_DYNAMIC",    # MXFP4 dynamic
     "A16W4_MXFP",           # MXFP4 weight-only
+    "A16W2_HQQ_INT",        # GGUF Q2_K int2 weight-only
     "A16W4_HQQ_INT",        # HQQ/GPTQ/GPTQMarlin int4 weight-only
     "A16W8_HQQ_INT",        # HQQ/GPTQ/GPTQMarlin int8 weight-only
 }
@@ -276,9 +277,12 @@ class GemliteAwqMarlinConfig(AWQMarlinConfig):
 
 class GemliteGGUFConfig(GGUFConfig):
     """Wrap stock GGUFLinearMethod with GemliteGGUFLinearMethod for supported
-    affine block types (Q4_0/Q4_1 -> A16W4_HQQ_INT, Q8_0 -> A16W8_HQQ_INT).
-    Unsupported types (K-quants, I-quants, MoE, embedding) fall through to
-    stock."""
+    affine block types:
+        Q4_0 / Q4_1 / Q4_K -> A16W4_HQQ_INT
+        Q8_0               -> A16W8_HQQ_INT
+        Q2_K               -> A16W2_HQQ_INT
+    Unsupported types (Q3_K/Q5_K/Q6_K, I-quants, MoE, embedding) fall through
+    to stock."""
 
     @classmethod
     def get_name(cls):
@@ -288,7 +292,9 @@ class GemliteGGUFConfig(GGUFConfig):
         method = super().get_quant_method(layer, prefix)
         if (isinstance(method, GGUFLinearMethod)
                 and type(method) is GGUFLinearMethod
-                and (_enabled("A16W4_HQQ_INT") or _enabled("A16W8_HQQ_INT"))):
+                and (_enabled("A16W2_HQQ_INT")
+                     or _enabled("A16W4_HQQ_INT")
+                     or _enabled("A16W8_HQQ_INT"))):
             return GemliteGGUFLinearMethod(self)
         return method
 
@@ -335,6 +341,7 @@ def _build_overrides() -> dict[str, type]:
         o["gptq_marlin"] = GemliteGptqMarlinConfig
         o["awq"] = GemliteAwqConfig
         o["awq_marlin"] = GemliteAwqMarlinConfig
+    if _ENABLED & {"A16W2_HQQ_INT", "A16W4_HQQ_INT", "A16W8_HQQ_INT"}:
         o["gguf"] = GemliteGGUFConfig
     return o
 

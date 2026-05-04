@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """All gemlite LinearMethod schemes: FP8 block / per-tensor, NVFP4,
-MXFP4, INT8 (A16W8, A8W8), A16W4 GPTQ/HQQ, A16W4 AWQ, GGUF (Q4_0/Q4_1/Q8_0),
-and the compressed-tensors wrappers for NVFP4/MXFP4."""
+MXFP4, INT8 (A16W8, A8W8), A16W4 GPTQ/HQQ, A16W4 AWQ,
+GGUF (Q4_0/Q4_1/Q8_0/Q4_K/Q2_K), and the compressed-tensors wrappers for
+NVFP4/MXFP4."""
 
 from __future__ import annotations
 
@@ -11,7 +12,8 @@ import torch
 
 from gemlite.helper import (
     A4W4_NVFP_dynamic, A8W8_fp8_dynamic, A8W8_int8_dynamic,
-    A16W4_HQQ_INT, A16W4_MXFP, A16W4_NVFP, A16W8_HQQ_INT, A16W8_INT8,
+    A16W2_HQQ_INT, A16W4_HQQ_INT, A16W4_MXFP, A16W4_NVFP,
+    A16W8_HQQ_INT, A16W8_INT8,
 )
 from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 
@@ -484,14 +486,14 @@ class GemliteCTWNA16Int(GemliteCTApplyMixin,
 
 
 # ---------------------------------------------------------------------------
-# GGUF (Q4_0 / Q4_1 / Q8_0 -> A16W4_HQQ_INT / A16W8_HQQ_INT)
+# GGUF (Q4_0 / Q4_1 / Q4_K / Q8_0 / Q2_K -> A16W{2,4,8}_HQQ_INT)
 # ---------------------------------------------------------------------------
 
 _GGUF_CLEANUP = ("qweight", "qweight_type")
 
 
 class GemliteGGUFLinearMethod(GemliteApplyMixin, GGUFLinearMethod):
-    """GGUF weight-only via A16W{4,8}_HQQ_INT for supported block types.
+    """GGUF weight-only via A16W{2,4,8}_HQQ_INT for supported block types.
 
     Inherits create_weights from vLLM's GGUFLinearMethod, runs the stock
     padded-weight materialization, then decodes each shard of the padded
@@ -599,7 +601,7 @@ class GemliteGGUFLinearMethod(GemliteApplyMixin, GGUFLinearMethod):
         scales = torch.cat(scales_parts, dim=0).contiguous()
         zeros = torch.cat(zeros_parts, dim=0).contiguous()
 
-        HelperCls = A16W4_HQQ_INT if nbits == 4 else A16W8_HQQ_INT
+        HelperCls = {2: A16W2_HQQ_INT, 4: A16W4_HQQ_INT, 8: A16W8_HQQ_INT}[nbits]
         return HelperCls(
             device=W_q.device, dtype=dtype,
         ).from_weights(W_q=W_q, scales=scales, zeros=zeros, bias=None)
