@@ -368,8 +368,16 @@ class GemliteAwqLinearMethod(StockWrappedGemliteMethod):
 # ---------------------------------------------------------------------------
 
 class GemliteCTW4A4Fp4(GemliteCTApplyMixin, CompressedTensorsW4A4Fp4):
-    """W4A4 NVFP4. CT stores global scales as 448*6/amax; ModelOpt stores the
-    reciprocal. Gemlite inverts internally, so pre-invert to feed it ModelOpt."""
+    """W4A4 NVFP4.
+
+    CT checkpoints store `weight_global_scale = 448*6/amax(W)` and
+    `input_global_scale = 448*6/amax(x)` (see stock vLLM's
+    `compressed_tensors_w4a4_nvfp4.py`). Gemlite's A4W4_NVFP_dynamic helper:
+      - stores `meta_scale` verbatim (kernel uses it as-is), so we pass CT's
+        `weight_global_scale` directly.
+      - stores `1/input_scale` internally (ModelOpt convention), so we pre-
+        invert CT's `input_global_scale` with `_recip_max`.
+    """
 
     def process_weights_after_loading(self, layer) -> None:
         w = layer.weight_packed.data
@@ -377,7 +385,7 @@ class GemliteCTW4A4Fp4(GemliteCTApplyMixin, CompressedTensorsW4A4Fp4):
             device=w.device, dtype=_pick_dtype(layer, attr="params_dtype"),
         ).from_weights(
             weight=w, scales=layer.weight_scale.data,
-            meta_scale=_recip_max(layer.weight_global_scale),
+            meta_scale=_scalar_max_fp32(layer.weight_global_scale),
             input_scale=_recip_max(layer.input_global_scale),
             packed=True,
         )

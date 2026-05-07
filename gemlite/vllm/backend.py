@@ -123,13 +123,30 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
         if self._is_mxfp4(weight_quant) and "A16W4_MXFP" in _ENABLED:
             return GemliteCTW4A16Mxfp4()
 
-        try:
-            from compressed_tensors.quantization import (
-                is_activation_quantization_format,
+        # compressed_tensors moved this helper between versions; vLLM also
+        # re-exports it from its CT utils module. Try all known locations so
+        # we never silently fall back to act_fmt=False (which hid NVFP4 W4A4
+        # routing in earlier revisions).
+        is_act = None
+        for _modname, _attr in (
+            ("compressed_tensors.quantization", "is_activation_quantization_format"),
+            ("compressed_tensors.compressors.format", "is_activation_quantization_format"),
+            ("vllm.model_executor.layers.quantization.compressed_tensors.utils",
+             "is_activation_quantization_format"),
+        ):
+            try:
+                _m = __import__(_modname, fromlist=[_attr])
+                is_act = getattr(_m, _attr, None)
+                if is_act is not None:
+                    break
+            except Exception:
+                continue
+        if is_act is None:
+            raise RuntimeError(
+                "gemlite.vllm: could not locate is_activation_quantization_format "
+                "in compressed_tensors or vllm; update the gemlite backend."
             )
-            act_fmt = is_activation_quantization_format(format or self.quant_format)
-        except Exception:
-            act_fmt = False
+        act_fmt = is_act(format or self.quant_format)
         if (act_fmt
                 and self._is_nvfp4_format(weight_quant)
                 and self._is_nvfp4_format(input_quant)

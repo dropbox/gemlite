@@ -57,20 +57,13 @@ enable_gemlite(["A8W8_FP8_DYNAMIC", "A16W4_HQQ_INT"])
 
 ## 2. `vllm serve` / OpenAI-compatible server
 
-Set `VLLM_GEMLITE_ENABLE=1` and pre-import `gemlite.vllm` in a bootstrap:
+`gemlite` registers a `vllm.general_plugins` entry point (see `setup.py`),
+so plain `vllm serve` auto-discovers and installs the patch at engine
+startup. Just set `VLLM_GEMLITE_ENABLE=1`:
 
 ```bash
-#!/usr/bin/env bash
 export VLLM_GEMLITE_ENABLE=1
-
-python3 -c "
-import sys, gemlite.vllm            # triggers patch_vllm() via env var
-sys.argv = ['vllm', 'serve', 'Qwen/Qwen3-4B-Instruct-2507-FP8',
-            '--dtype', 'bfloat16',
-            '--port', '8000']
-from vllm.entrypoints.cli.main import main
-main()
-"
+vllm serve Qwen/Qwen3-4B-Instruct-2507-FP8 --dtype bfloat16 --port 8000
 ```
 
 Restrict to a subset:
@@ -79,20 +72,22 @@ Restrict to a subset:
 export VLLM_GEMLITE_ENABLE_LIST=A8W8_FP8_DYNAMIC,A16W4_HQQ_INT
 ```
 
-### As a vLLM plugin (no bootstrap)
+### Bootstrap (fallback)
 
-Once `gemlite`'s `setup.py` registers the plugin entry point:
+If the plugin entry point isn't discovered (e.g. an editable install that
+skipped `pip install -e .` after adding the entry point), pre-import
+`gemlite.vllm` in a wrapper instead:
 
-```python
-entry_points={
-    "vllm.general_plugins": [
-        "gemlite = gemlite.vllm.backend:register",
-    ],
-}
+```bash
+export VLLM_GEMLITE_ENABLE=1
+python3 -c "
+import sys, gemlite.vllm            # triggers patch_vllm() via env var
+sys.argv = ['vllm', 'serve', 'Qwen/Qwen3-4B-Instruct-2507-FP8',
+            '--dtype', 'bfloat16', '--port', '8000']
+from vllm.entrypoints.cli.main import main
+main()
+"
 ```
-
-plain `vllm serve ...` invokes `register()` → `patch_vllm()` at engine
-startup, so `VLLM_GEMLITE_ENABLE=1` alone is enough — no pre-import.
 
 ## 3. Pre-quantized checkpoints
 
@@ -164,14 +159,10 @@ with that env var set triggers `patch_vllm()`, which calls
 
 | Name                          | Default   | Purpose                                              |
 | ----------------------------- | --------- | ---------------------------------------------------- |
-| `VLLM_GEMLITE_ENABLE`         | `0`/`1` * | `"0"` disables pre-quantized routing in `patch_vllm()`. Set to `"1"` to make a plain `import gemlite.vllm` auto-apply the patch. |
+| `VLLM_GEMLITE_ENABLE`         | `0`       | Set to `"1"` to route pre-quantized checkpoints through gemlite. Required for `vllm serve` (both plugin and bootstrap paths). |
 | `VLLM_GEMLITE_ENABLE_LIST`    | (unset)   | Comma-separated subset of `SUPPORTED` scheme names.  |
 | `VLLM_GEMLITE_ONTHEFLY_QUANT` | (unset)   | Preset name — enables on-the-fly quantization.       |
 | `VLLM_GEMLITE_SKIP_MODULES`   | `lm_head,visual,vision` | Comma-separated module names to leave unquantized (on-the-fly only). |
-
-\* Default `"0"` for the import-time autopatch guard; default `"1"` for
-`patch_vllm()` when called directly. In practice: set `=1` to enable via
-import, set `=0` to explicitly disable.
 
 ## Notes
 
@@ -184,3 +175,30 @@ import, set `=0` to explicitly disable.
   keeps its stock vLLM forward path. This applies per-layer, not per-model:
   a model with unsupported GGUF tensors still uses gemlite on the supported
   ones.
+
+## Tested
+
+Verified end-to-end on RTX PRO 6000 Blackwell (sm_120, CUDA 13, vLLM 0.19.2):
+across all three activation paths (offline `LLM`, `vllm serve` bootstrap,
+plain `vllm serve` via plugin):
+
+| Model                                        | Format                     | Scheme                          |
+| -------------------------------------------- | -------------------------- | ------------------------------- |
+| `Firworks/Qwen3-4B-Instruct-2507-nvfp4`      | CT NVFP4 W4A4              | `A4W4_NVFP_DYNAMIC`             |
+| `Qwen/Qwen3-4B-Instruct-2507-FP8`            | DeepSeek block FP8 128×128 | `A8W8_FP8_DYNAMIC`              |
+| `cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit`   | CT pack-quantized int4     | `A16W4_HQQ_INT`                 |
+| `JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int4`  | GPTQ int4 (→ gptq_marlin)  | `A16W4_HQQ_INT`                 |
+| `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_1`   | GGUF Q4_1                  | `A16W4_HQQ_INT`                 |
+
+GGUF checkpoints require `--hf-config-path <hf-repo>` on `vllm serve`.
+
+## Troubleshooting
+
+- **`collective_rpc` with custom functions** — set
+  `VLLM_ALLOW_INSECURE_SERIALIZATION=1` to let vLLM pickle arbitrary
+  callables to workers. Only relevant if you pass your own probe/closure,
+  not for normal inference.
+- **Plugin not firing under plain `vllm serve`** — verify the entry point
+  is registered: `python3 -c "from importlib.metadata import entry_points;
+  print([e for e in entry_points().select(group='vllm.general_plugins')])"`
+  should include `gemlite`. If missing, reinstall: `pip install -e /path/to/gemlite`.

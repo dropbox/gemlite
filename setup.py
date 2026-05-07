@@ -12,6 +12,11 @@ setup(
     },
     include_package_data=True,
     install_requires=["numpy", "tqdm", "triton>=3.6.0"],
+    entry_points={
+        "vllm.general_plugins": [
+            "gemlite = gemlite.vllm.backend:register",
+        ],
+    },
 )
 
 # python3 setup.py install
