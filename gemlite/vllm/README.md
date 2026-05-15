@@ -64,12 +64,14 @@ enable_gemlite(["A8W8_FP8_DYNAMIC", "A16W4_HQQ_INT"])
 
 `gemlite` registers a `vllm.general_plugins` entry point (see `setup.py`),
 so plain `vllm serve` auto-discovers and installs the patch at engine
-startup. Just set `VLLM_GEMLITE_ENABLE=1`:
+startup. Set `VLLM_GEMLITE_ENABLE=1` to opt in:
 
 ```bash
 export VLLM_GEMLITE_ENABLE=1
 vllm serve Qwen/Qwen3-4B-Instruct-2507-FP8 --dtype bfloat16 --port 8000
 ```
+
+Same env var works with `python -m vllm.entrypoints.openai.api_server ...`.
 
 Restrict to a subset:
 
@@ -116,9 +118,29 @@ Aliases: `A16W4_INT` → `A16W4_HQQ_INT`, `A16W8_INT` → `A16W8_HQQ_INT`.
 
 ## 4. On-the-fly quantization
 
-Quantize an fp16/bf16 checkpoint at load time.
+Quantize an **fp16 / bf16** checkpoint at load time. This path is a no-op
+on already-quantized checkpoints (FP8 / AWQ / GPTQ / GGUF / …) — those
+arrive with a `quant_config` attached, and the on-the-fly hook only
+replaces layers whose `quant_config is None`. For pre-quantized models use
+`VLLM_GEMLITE_ENABLE=1` (section 2/3) instead.
 
-Programmatic:
+Via env var (uses a named preset) — **the recommended path** for `vllm serve`
+and offline `LLM`, because it propagates to v1 worker subprocesses:
+
+```bash
+export VLLM_GEMLITE_ONTHEFLY_QUANT=A16W8_INT8
+export VLLM_GEMLITE_SKIP_MODULES=lm_head,visual,vision
+vllm serve Qwen/Qwen3-4B --dtype bfloat16 --port 8000
+```
+
+`VLLM_GEMLITE_ONTHEFLY_QUANT` alone is enough — gemlite's plugin
+`register()` runs `patch_vllm()` in every worker, which calls
+`set_onthefly_quant(...)` with the matching preset.
+
+Programmatic — works for offline `LLM` only when v1 spawn is disabled
+(`VLLM_USE_V1=0`) or for code paths that don't fork workers; under v1 the
+parent-process monkey-patch does **not** propagate to workers, so use the
+env-var path for `vllm serve` / multi-process scenarios:
 
 ```python
 from gemlite.vllm import set_onthefly_quant
@@ -131,16 +153,9 @@ from vllm import LLM
 llm = LLM(model="Qwen/Qwen3-4B", dtype="bfloat16")
 ```
 
-Via env var (uses a named preset):
-
-```bash
-export VLLM_GEMLITE_ONTHEFLY_QUANT=A16W8_INT8
-export VLLM_GEMLITE_SKIP_MODULES=lm_head,visual,vision
-```
-
-`VLLM_GEMLITE_ONTHEFLY_QUANT` alone is enough — importing `gemlite.vllm`
-with that env var set triggers `patch_vllm()`, which calls
-`set_onthefly_quant(...)`.
+If you need a custom `weight_bits` / `group_size` combo not in the preset
+table, add an entry to `_ONTHEFLY_PRESETS` in `gemlite/vllm/backend.py` and
+select it via `VLLM_GEMLITE_ONTHEFLY_QUANT`.
 
 ### Presets
 
@@ -166,7 +181,7 @@ with that env var set triggers `patch_vllm()`, which calls
 | ----------------------------- | --------- | ---------------------------------------------------- |
 | `VLLM_GEMLITE_ENABLE`         | `0`       | Set to `"1"` to route pre-quantized checkpoints through gemlite. Required for `vllm serve` (both plugin and bootstrap paths). |
 | `VLLM_GEMLITE_ENABLE_LIST`    | (unset)   | Comma-separated subset of `SUPPORTED` scheme names.  |
-| `VLLM_GEMLITE_ONTHEFLY_QUANT` | (unset)   | Preset name — enables on-the-fly quantization.       |
+| `VLLM_GEMLITE_ONTHEFLY_QUANT` | (unset)   | Preset name — enables on-the-fly quantization (fp16/bf16 checkpoints only). |
 | `VLLM_GEMLITE_SKIP_MODULES`   | `lm_head,visual,vision` | Comma-separated module names to leave unquantized (on-the-fly only). |
 
 ## Notes
@@ -195,15 +210,37 @@ plain `vllm serve` via plugin):
 | `JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int4`  | GPTQ int4 (→ gptq_marlin)  | `A16W4_HQQ_INT`                 |
 | `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_1`   | GGUF Q4_1                  | `A16W4_HQQ_INT`                 |
 
-GGUF checkpoints require `--hf-config-path <hf-repo>` on `vllm serve`.
+GGUF checkpoints require `--hf-config-path <hf-repo>` on `vllm serve`, and
+must use `--dtype float16` (vLLM rejects `bfloat16` for GGUF).
 
 ## Troubleshooting
+
+- **`KeyError: 'gemlite_linear'` after toggling `VLLM_GEMLITE_ENABLE`** —
+  vLLM's torch.compile cache key doesn't include the quant method, so a
+  graph compiled with gemlite enabled gets reused on the next run with
+  gemlite disabled (and vice-versa), and the cached graph references
+  `layer.gemlite_linear` which no longer exists. Wipe the cache when
+  switching backends:
+
+  ```bash
+  rm -rf ~/.cache/vllm/torch_compile_cache
+  ```
+
+- **GGUF + bfloat16 rejected** — vLLM only accepts `float16` / `float32`
+  for GGUF quant. Pass `--dtype float16`. Also pass `--hf-config-path
+  <unquantized-repo>` if the GGUF repo doesn't ship a `config.json`
+  (e.g. `unsloth/*-GGUF` repos).
 
 - **`collective_rpc` with custom functions** — set
   `VLLM_ALLOW_INSECURE_SERIALIZATION=1` to let vLLM pickle arbitrary
   callables to workers. Only relevant if you pass your own probe/closure,
   not for normal inference.
+
 - **Plugin not firing under plain `vllm serve`** — verify the entry point
-  is registered: `python3 -c "from importlib.metadata import entry_points;
-  print([e for e in entry_points().select(group='vllm.general_plugins')])"`
+  is registered:
+
+  ```bash
+  python3 -c "from importlib.metadata import entry_points; print([e for e in entry_points().select(group='vllm.general_plugins')])"
+  ```
+
   should include `gemlite`. If missing, reinstall: `pip install -e /path/to/gemlite`.

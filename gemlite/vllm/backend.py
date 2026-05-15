@@ -393,7 +393,7 @@ def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
 # Env-driven entry point + vLLM plugin hook
 #
 # Env vars:
-#   VLLM_GEMLITE_ENABLE         -- "0"/"1" (default "1"). Pre-quantized path.
+#   VLLM_GEMLITE_ENABLE         -- "0"/"1" (default "0"). Pre-quantized path.
 #   VLLM_GEMLITE_ENABLE_LIST    -- comma-separated subset of SUPPORTED names.
 #   VLLM_GEMLITE_ONTHEFLY_QUANT -- preset name; on-the-fly quantization.
 #   VLLM_GEMLITE_SKIP_MODULES   -- comma-separated skip list overrides.
@@ -432,7 +432,7 @@ def patch_vllm() -> None:
     skip_env = os.environ.get("VLLM_GEMLITE_SKIP_MODULES")
     skip_modules = _split_csv(skip_env) if skip_env else list(_DEFAULT_SKIP)
 
-    if os.environ.get("VLLM_GEMLITE_ENABLE", "1") != "0":
+    if os.environ.get("VLLM_GEMLITE_ENABLE", "0") != "0":
         names_env = os.environ.get("VLLM_GEMLITE_ENABLE_LIST")
         try:
             enable_gemlite(_split_csv(names_env) if names_env else None)
