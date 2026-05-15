@@ -35,6 +35,11 @@ vLLM with a warning. Nothing hard-fails.
 - `vllm`
 - `hqq` — only if you use on-the-fly `int4_weightonly`
 
+On Blackewell, make sure you use CUDA 13 PTXAS
+```
+export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas
+```
+
 ## 1. Interactive Python / offline `LLM`
 
 Import and enable **before** constructing `LLM`:
