@@ -12,3 +12,6 @@ __pycache__
 *.whl
 *.tar.gz
 *.zip
+
+# Build artifacts
+build/

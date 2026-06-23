@@ -25,6 +25,28 @@ reset_config()
 if not _autotune: set_autotune(False)
 KERNEL_CACHE.ENABLE = False
 
+class TestFreshStateDictSchema(unittest.TestCase):
+    """Fresh modules should advertise the serialized GemLite checkpoint schema."""
+
+    def test_fresh_module_exposes_quantized_weight_keys(self):
+        layer = GemLiteLinearTriton()
+        state_dict = layer.state_dict()
+
+        expected_keys = {
+            "W_q",
+            "bias",
+            "scales",
+            "zeros",
+            "metadata",
+            "orig_shape",
+            "meta_scale",
+        }
+        self.assertTrue(expected_keys.issubset(state_dict.keys()))
+        self.assertEqual(state_dict["W_q"].numel(), 0)
+        self.assertEqual(state_dict["metadata"].dtype, torch.int32)
+        self.assertEqual(state_dict["orig_shape"].dtype, torch.int32)
+        self.assertEqual(state_dict["meta_scale"].dtype, torch.float32)
+
 def _check_serialization(test_case, gemlite_linear, matmul_type='GEMM', batch_size=32, tol=1e-7):
     """Shared serialization round-trip check."""
     in_features = gemlite_linear.in_features

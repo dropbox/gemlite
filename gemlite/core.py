@@ -353,7 +353,6 @@ class GemLiteLinearTriton(torch.nn.Module):
 
         self.in_features  = in_features
         self.out_features = out_features
-        self.orig_shape   = (out_features, in_features)
         self.W_nbits      = W_nbits
         self.group_size   = group_size
         self.unpack_mask  = 2**self.W_nbits - 1
@@ -377,13 +376,19 @@ class GemLiteLinearTriton(torch.nn.Module):
         #Default forward        
         self.forward = self.forward_auto_no_warmup
 
-        #Meta-scale for NVFP4 (0.0 = not used)
-        self.meta_scale = 0.0
+        # Register empty placeholders so fresh modules advertise GemLite checkpoint keys.
+        self.register_buffer("W_q", torch.empty(0, dtype=torch.uint8))
+        self.register_buffer("bias", torch.empty(0, dtype=self.compute_dtype))
+        self.register_buffer("scales", torch.empty(0, dtype=torch.int32))
+        self.register_buffer("zeros", torch.empty(0, dtype=torch.int32))
+        self.register_buffer("metadata", torch.empty(0, dtype=torch.int32))
+        self.register_buffer("orig_shape", torch.empty(0, dtype=torch.int32))
+        self.register_buffer("meta_scale", torch.tensor(0.0, dtype=torch.float32))
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         # Rebuild metadata from live attributes to ensure consistency
         # (helpers may override channel_scale_mode/W_group_mode after pack())
-        if hasattr(self, 'metadata') and self.metadata is not None and hasattr(self, 'W_nbits'):
+        if hasattr(self, 'metadata') and self.metadata is not None and hasattr(self, 'W_nbits') and self.W_q.numel() > 0:
             self.metadata = torch.nn.Parameter(
                 torch.tensor(self.get_meta_args(), device=self.W_q.device if isinstance(self.W_q, (torch.Tensor, torch.nn.Parameter)) else 'cpu', dtype=torch.int32),
                 requires_grad=False,
@@ -396,11 +401,11 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.scales     = state_dict.pop("scales", None)
         self.zeros      = state_dict.pop("zeros", None)
         self.metadata   = state_dict.pop("metadata", None)
-        self.orig_shape = state_dict.pop("orig_shape", None)
+        orig_shape      = state_dict.pop("orig_shape", None)
         _meta_scale     = state_dict.pop("meta_scale", None)
 
-        self.metadata   = [v.item() for v in self.metadata]
-        self.orig_shape = tuple(v.item() for v in self.orig_shape)
+        metadata        = [v.item() for v in self.metadata]
+        orig_shape      = tuple(v.item() for v in orig_shape)
 
         (self.scaled_activations,
         self.W_nbits,
@@ -413,7 +418,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.meta_dtype,
         self.channel_scale_mode,
         self.W_group_mode,
-        self.data_contiguous) = self.metadata
+        self.data_contiguous) = metadata
 
         self.input_dtype  = DType(self.input_dtype)
         self.output_dtype = DType(self.output_dtype)
@@ -422,11 +427,11 @@ class GemLiteLinearTriton(torch.nn.Module):
 
         # Restore meta_scale with backward compat for old checkpoints
         if _meta_scale is not None:
-            self.meta_scale = _meta_scale.float()
+            meta_scale = _meta_scale.float()
         else:
-            self.meta_scale = 0.05 if self.input_dtype == DType.NVFP4 else 0.0  # backward compat default for old checkpoints
+            meta_scale = 0.05 if self.input_dtype == DType.NVFP4 else 0.0  # backward compat default for old checkpoints
 
-        self.out_features, self.in_features = self.orig_shape
+        self.out_features, self.in_features = orig_shape
         self.compute_dtype = DTYPE_TO_TORCH[self.input_dtype.value]
         self.scaled_activations = bool(self.scaled_activations)
         self.data_contiguous = bool(self.data_contiguous)
@@ -457,7 +462,7 @@ class GemLiteLinearTriton(torch.nn.Module):
             requires_grad=False,
         )
         if not isinstance(self.meta_scale, torch.nn.Parameter):
-            _ms = self.meta_scale.item() if isinstance(self.meta_scale, torch.Tensor) else float(self.meta_scale)
+            _ms = meta_scale.item() if isinstance(meta_scale, torch.Tensor) else float(meta_scale)
             self.meta_scale = torch.nn.Parameter(
                 torch.tensor(_ms, device=_device, dtype=torch.float32),
                 requires_grad=False,
@@ -529,7 +534,7 @@ class GemLiteLinearTriton(torch.nn.Module):
             _pack_weights_over_cols = pack_weights_over_cols_triton if (W_q.device.type == "cuda") else pack_weights_over_cols_torch
 
             self.W_q, self.elements_per_sample = _pack_weights_over_cols(
-                W_q.view(self.orig_shape),
+                W_q.view((self.out_features, self.in_features)),
                 W_nbits=self.W_nbits,
                 packing_bitwidth=packing_bitwidth,
                 transpose=True,
@@ -682,7 +687,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         
 
         self.meta_scale = torch.nn.Parameter(
-            torch.tensor(self.meta_scale, device=self.device, dtype=torch.float32),
+            torch.tensor(float(self.meta_scale), device=self.device, dtype=torch.float32),
             requires_grad=False,
         )
 
