@@ -46,15 +46,40 @@ class TestFreshStateDictSchema(unittest.TestCase):
         self.assertEqual(state_dict["metadata"].dtype, torch.int32)
         self.assertEqual(state_dict["orig_shape"].dtype, torch.int32)
         self.assertEqual(state_dict["meta_scale"].dtype, torch.float32)
+        self.assertNotIn("bias", GemLiteLinearTriton(bias=False).state_dict())
+
+def _assert_tensor_schema_match(test_case, ref_sd, loaded, keys):
+    """Verify loaded tensors match the checkpoint's dtype/shape/numel exactly."""
+    loaded_sd = loaded.state_dict()
+    for key in keys:
+        ref_has_key = key in ref_sd
+        loaded_has_key = key in loaded_sd
+        test_case.assertEqual(ref_has_key, loaded_has_key,
+                              f"{key}: key presence mismatch")
+        if not ref_has_key:
+            continue
+
+        ref = ref_sd[key]
+        got = loaded_sd[key]
+        test_case.assertEqual(ref.dtype, got.dtype,
+                              f"{key}: dtype mismatch ref={ref.dtype} loaded={got.dtype}")
+        test_case.assertEqual(tuple(ref.shape), tuple(got.shape),
+                              f"{key}: shape mismatch ref={tuple(ref.shape)} loaded={tuple(got.shape)}")
+        test_case.assertEqual(ref.numel(), got.numel(),
+                              f"{key}: numel mismatch ref={ref.numel()} loaded={got.numel()}")
 
 def _check_serialization(test_case, gemlite_linear, matmul_type='GEMM', batch_size=32, tol=1e-7):
     """Shared serialization round-trip check."""
     in_features = gemlite_linear.in_features
 
-    torch.save(gemlite_linear.state_dict(), dummy_file)
+    ref_sd = gemlite_linear.state_dict()
+    torch.save(ref_sd, dummy_file)
 
     loaded = GemLiteLinearTriton()
     loaded.load_state_dict(torch.load(dummy_file))
+
+    # Check checkpoint tensor dtype/shape/numel survived loading
+    _assert_tensor_schema_match(test_case, ref_sd, loaded, ("W_q", "scales", "zeros"))
 
     # Check meta_args match
     ref_meta = gemlite_linear.get_meta_args()
@@ -67,8 +92,8 @@ def _check_serialization(test_case, gemlite_linear, matmul_type='GEMM', batch_si
     loaded_tensors = loaded.get_tensor_args()
     for i in range(len(ref_tensors)):
         if ref_tensors[i] is not None and ref_tensors[i].numel() > 0:
-            diff = (ref_tensors[i].float() - loaded_tensors[i].float()).abs().mean().item()
-            test_case.assertEqual(diff, 0, f"tensor_args mismatch at {i}: mean diff = {diff}")
+            test_case.assertTrue(torch.equal(ref_tensors[i], loaded_tensors[i]),
+                                 f"tensor_args mismatch at {i}")
 
     # Check inference matches
     x = torch.randn(batch_size, in_features, dtype=compute_dtype, device=device) / 10.
@@ -80,6 +105,43 @@ def _check_serialization(test_case, gemlite_linear, matmul_type='GEMM', batch_si
 
 class TestSerializationINT(unittest.TestCase):
     """Serialization tests for INT quantized layers."""
+
+    def test_A16W4_packing_scale_and_zero_dtypes(self):
+        """Different packing, scale, and zero dtypes survive save/load."""
+        in_features, out_features = 2048, 1024
+        W_nbits, group_size = 4, 128
+
+        W_q = torch.randint(0, 2**W_nbits - 1, (out_features, in_features), device=device).to(torch.uint8)
+        gs = W_q.numel() // group_size
+        cases = (
+            (8, torch.uint8, torch.bfloat16, torch.bfloat16, True),
+            (16, torch.int16, torch.float16, torch.int16, False),
+            (32, torch.int32, torch.float32, torch.int32, False),
+        )
+
+        for packing_bitwidth, expected_W_q_dtype, scales_dtype, zeros_dtype, fma_mode in cases:
+            with self.subTest(packing_bitwidth=packing_bitwidth,
+                              W_q_dtype=expected_W_q_dtype,
+                              scales_dtype=scales_dtype,
+                              zeros_dtype=zeros_dtype):
+                scales = torch.ones((gs, 1), device=device, dtype=scales_dtype) * 0.001
+                zeros = torch.full((gs, 1), (2**W_nbits - 1) // 2,
+                                   device=device, dtype=zeros_dtype)
+
+                gemlite_linear = GemLiteLinearTriton(W_nbits,
+                                group_size=group_size,
+                                in_features=in_features,
+                                out_features=out_features,
+                                input_dtype=gemlite_dtype,
+                                output_dtype=gemlite_dtype)
+                gemlite_linear.pack(W_q, scales, zeros, None,
+                                    fma_mode=fma_mode,
+                                    packing_bitwidth=packing_bitwidth)
+
+                self.assertEqual(gemlite_linear.W_q.dtype, expected_W_q_dtype)
+                self.assertEqual(gemlite_linear.scales.dtype, scales_dtype)
+                self.assertEqual(gemlite_linear.zeros.dtype, zeros_dtype)
+                _check_serialization(self, gemlite_linear)
 
     def test_A16W4(self):
         in_features, out_features = 4096, 2048

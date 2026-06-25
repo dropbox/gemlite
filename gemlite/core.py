@@ -317,10 +317,13 @@ class GemLiteLinearTriton(torch.nn.Module):
         output_dtype = DType.FP16,
         acc_dtype = None,
         scaled_activations = False,
+        bias = True,
     ):
         global _GROUP_SIZE_WARNED
 
         super().__init__()
+
+        self.use_bias = bool(bias)
 
         if W_nbits not in GemLiteLinearTriton.SUPPORTED_BITS_TRITON:
             raise NotImplementedError(
@@ -376,11 +379,14 @@ class GemLiteLinearTriton(torch.nn.Module):
         #Default forward        
         self.forward = self.forward_auto_no_warmup
 
-        # Register empty placeholders so fresh modules advertise GemLite checkpoint keys.
-        self.register_buffer("W_q", torch.empty(0, dtype=torch.uint8))
-        self.register_buffer("bias", torch.empty(0, dtype=self.compute_dtype))
-        self.register_buffer("scales", torch.empty(0, dtype=torch.int32))
-        self.register_buffer("zeros", torch.empty(0, dtype=torch.int32))
+        # Empty placeholders are schema markers only.
+        # The actual dtype/shape/layout of these tensors is determined by
+        # the checkpoint or by pack(), and load_state_dict() must replace them.
+        self.register_buffer("W_q", torch.empty(0))
+        if self.use_bias:
+            self.register_buffer("bias", torch.empty(0))
+        self.register_buffer("scales", torch.empty(0))
+        self.register_buffer("zeros", torch.empty(0))
         self.register_buffer("metadata", torch.empty(0, dtype=torch.int32))
         self.register_buffer("orig_shape", torch.empty(0, dtype=torch.int32))
         self.register_buffer("meta_scale", torch.tensor(0.0, dtype=torch.float32))
