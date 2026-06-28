@@ -403,5 +403,93 @@ class TestBiasRoundTrip(unittest.TestCase):
         self.assertTrue(diff < 1e-7, f"Sequential bias round-trip inference mismatch: {diff}")
 
 
+class TestAssignTrueLoad(unittest.TestCase):
+    """HF Diffusers' meta-device path uses load_state_dict(..., assign=True),
+    which tells PyTorch to swap tensor objects rather than copy_ into them.
+    Our _load_from_state_dict already swaps objects via _promote_to_parameter,
+    so this should work identically to the default path."""
+
+    def _make_INT_layer(self):
+        in_features, out_features = 2048, 1024
+        W_nbits, group_size = 4, 128
+        W_q = torch.randint(0, 2**W_nbits - 1, (out_features, in_features), device=device).to(torch.uint8)
+        gs = W_q.numel() // group_size
+        scales = torch.ones((gs, 1), device=device, dtype=compute_dtype) * 0.001
+        zeros  = torch.full((gs, 1), (2**W_nbits - 1) // 2, device=device, dtype=compute_dtype)
+        layer = GemLiteLinearTriton(W_nbits,
+                        group_size=group_size,
+                        in_features=in_features,
+                        out_features=out_features,
+                        input_dtype=gemlite_dtype,
+                        output_dtype=gemlite_dtype)
+        layer.pack(W_q, scales, zeros, None)
+        return layer, in_features
+
+    def test_assign_true_sequential(self):
+        layer, in_features = self._make_INT_layer()
+        ref = torch.nn.Sequential(layer).to(device)
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        loaded.load_state_dict(torch.load(dummy_file), strict=True, assign=True)
+
+        x = torch.randn(32, in_features, dtype=compute_dtype, device=device) / 10.
+        diff = (ref[0].forward_manual(x, matmul_type='GEMM')
+                - loaded[0].forward_manual(x, matmul_type='GEMM')).abs().mean().item()
+        self.assertTrue(diff < 1e-7, f"assign=True Sequential inference mismatch: {diff}")
+
+
+class TestNnSequentialRoundTripMX(unittest.TestCase):
+    """Sequential round-trip for the MXFP/NVFP helper-quantized layers.
+    Helpers post-mutate state after pack() (e.g. A4W4_NVFP_dynamic sets
+    meta_scale as a Parameter; channel_scale_mode=4). The first save must
+    capture those post-pack mutations via _save_to_state_dict's metadata
+    rebuild, and the Sequential load must reproduce them faithfully."""
+
+    def setUp(self):
+        self.in_features, self.out_features = 4224, 2048
+        torch.manual_seed(42)
+        self.linear_layer = torch.nn.Linear(
+            self.in_features, self.out_features, dtype=compute_dtype, device=device, bias=False
+        )
+        self.linear_layer.weight.data /= 10.
+        self.linear_layer.weight.requires_grad = False
+
+    def _quantize(self, processor_fn):
+        model = torch.nn.Sequential(
+            torch.nn.Linear(self.in_features, self.out_features, dtype=compute_dtype, device=device, bias=False)
+        )
+        model.requires_grad_(False)
+        model[0].weight.data = self.linear_layer.weight.data.clone()
+        patch_model(model, device=device, processor=processor_fn(dtype=compute_dtype))
+        return model
+
+    def _run_sequential_round_trip(self, processor_fn, matmul_type='GEMM', batch_size=32, tol=1e-7):
+        ref = self._quantize(processor_fn)
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        loaded.load_state_dict(torch.load(dummy_file), strict=True)
+
+        # post-pack helpers may set meta_scale; verify it survived
+        self.assertEqual(ref[0].meta_scale.dtype, loaded[0].meta_scale.dtype)
+        self.assertTrue(torch.equal(ref[0].meta_scale, loaded[0].meta_scale),
+                        f"meta_scale mismatch ref={ref[0].meta_scale} loaded={loaded[0].meta_scale}")
+
+        x = torch.randn(batch_size, self.in_features, dtype=compute_dtype, device=device) / 10.
+        y_ref = ref[0].forward_manual(x, matmul_type=matmul_type)
+        y_loaded = loaded[0].forward_manual(x, matmul_type=matmul_type)
+        diff = (y_ref - y_loaded).abs().mean().item()
+        self.assertTrue(diff < tol, f"Sequential MX round-trip mismatch ({matmul_type}): diff={diff}")
+
+    def test_A4W4_MXFP_sequential(self):
+        self._run_sequential_round_trip(A4W4_MXFP_dynamic, matmul_type='GEMM')
+        self._run_sequential_round_trip(A4W4_MXFP_dynamic, matmul_type='GEMM_SPLITK', batch_size=2)
+
+    def test_A4W4_NVFP_sequential(self):
+        self._run_sequential_round_trip(A4W4_NVFP_dynamic, matmul_type='GEMM')
+        self._run_sequential_round_trip(A4W4_NVFP_dynamic, matmul_type='GEMM_SPLITK', batch_size=2)
+
+
 if __name__ == '__main__':
     unittest.main()
