@@ -242,5 +242,254 @@ class TestMXScales2Dto5D(unittest.TestCase):
         gc.GEMLITE_USE_TMA = old_tma
 
 
+class TestFreshStateDictSchema(unittest.TestCase):
+    """Fresh modules should advertise the serialized GemLite checkpoint schema
+    so generic PyTorch loaders (HF Diffusers etc.) can match keys before
+    dispatching load logic. See issue #68."""
+
+    def test_fresh_module_exposes_quantized_weight_keys(self):
+        layer = GemLiteLinearTriton()
+        keys = set(layer.state_dict().keys())
+        expected = {"W_q", "scales", "zeros", "metadata", "orig_shape", "meta_scale"}
+        self.assertTrue(
+            expected.issubset(keys),
+            f"Fresh state_dict() missing keys: {expected - keys}",
+        )
+        # bias absent on fresh module (nn.Linear-style: registered only when populated)
+        self.assertNotIn("bias", keys)
+
+    def test_fresh_module_placeholder_shapes(self):
+        layer = GemLiteLinearTriton()
+        sd = layer.state_dict()
+        self.assertEqual(sd["W_q"].numel(),        0)
+        self.assertEqual(sd["scales"].numel(),     0)
+        self.assertEqual(sd["zeros"].numel(),      0)
+        self.assertEqual(sd["metadata"].numel(),   0)
+        self.assertEqual(sd["orig_shape"].numel(), 0)
+        # meta_scale is a 0-D scalar
+        self.assertEqual(sd["meta_scale"].dim(),   0)
+
+
+class TestNnSequentialRoundTrip(unittest.TestCase):
+    """The actual HF-style loader path: a parent nn.Module owns the GemLite
+    layer and calls load_state_dict() on the parent. PyTorch then dispatches
+    _load_from_state_dict() to each submodule. The pre-existing direct-load
+    tests do NOT exercise this path (they call
+    GemLiteLinearTriton.load_state_dict() at the top level), and this is
+    the path issue #68 cares about."""
+
+    def _make_INT_layer(self):
+        in_features, out_features = 4096, 2048
+        W_nbits, group_size = 4, 128
+
+        W_q = torch.randint(0, 2**W_nbits - 1, (out_features, in_features), device=device).to(torch.uint8)
+        gs = W_q.numel() // group_size
+        scales = torch.ones((gs, 1), device=device, dtype=compute_dtype) * 0.001
+        zeros  = torch.full((gs, 1), (2**W_nbits - 1) // 2, device=device, dtype=compute_dtype)
+
+        layer = GemLiteLinearTriton(W_nbits,
+                        group_size=group_size,
+                        in_features=in_features,
+                        out_features=out_features,
+                        input_dtype=gemlite_dtype,
+                        output_dtype=gemlite_dtype)
+        layer.pack(W_q, scales, zeros, None)
+        return layer, in_features
+
+    def test_sequential_save_load_INT(self):
+        layer, in_features = self._make_INT_layer()
+        ref = torch.nn.Sequential(layer).to(device)
+
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        # Standard PyTorch flow: load_state_dict on the parent module.
+        # This goes through _load_from_state_dict(prefix='0.') for our layer,
+        # NOT GemLiteLinearTriton.load_state_dict at the top level.
+        missing, unexpected = loaded.load_state_dict(torch.load(dummy_file), strict=False)
+        self.assertEqual(missing,    [], f"missing keys: {missing}")
+        self.assertEqual(unexpected, [], f"unexpected keys: {unexpected}")
+
+        x = torch.randn(32, in_features, dtype=compute_dtype, device=device) / 10.
+        y_ref = ref[0].forward_manual(x, matmul_type='GEMM')
+        y_loaded = loaded[0].forward_manual(x, matmul_type='GEMM')
+        diff = (y_ref - y_loaded).abs().mean().item()
+        self.assertTrue(diff < 1e-7, f"Sequential round-trip inference mismatch: {diff}")
+
+    def test_sequential_strict_load_INT(self):
+        """strict=True must succeed: confirms _load_from_state_dict consumed
+        every GemLite key cleanly (no stragglers, no missing)."""
+        layer, _ = self._make_INT_layer()
+        ref = torch.nn.Sequential(layer).to(device)
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        loaded.load_state_dict(torch.load(dummy_file), strict=True)
+
+
+class TestPackingBitwidthDtypes(unittest.TestCase):
+    """W_q dtype depends on packing_bitwidth: uint8 (pb=8), int16 (pb=16),
+    int32 (pb=32). Round-trip must preserve dtype across all three."""
+
+    def test_packing_bitwidth_matrix(self):
+        in_features, out_features = 2048, 1024
+        W_nbits, group_size = 4, 128
+
+        W_q_raw = torch.randint(0, 2**W_nbits - 1, (out_features, in_features), device=device).to(torch.uint8)
+        gs = W_q_raw.numel() // group_size
+
+        for pb, expected_dtype in ((8, torch.uint8), (16, torch.int16), (32, torch.int32)):
+            with self.subTest(packing_bitwidth=pb):
+                scales = torch.ones((gs, 1), device=device, dtype=compute_dtype) * 0.001
+                zeros  = torch.full((gs, 1), (2**W_nbits - 1) // 2, device=device, dtype=compute_dtype)
+
+                layer = GemLiteLinearTriton(W_nbits,
+                                group_size=group_size,
+                                in_features=in_features,
+                                out_features=out_features,
+                                input_dtype=gemlite_dtype,
+                                output_dtype=gemlite_dtype)
+                layer.pack(W_q_raw.clone(), scales, zeros, None, packing_bitwidth=pb)
+                self.assertEqual(layer.W_q.dtype, expected_dtype,
+                                 f"pb={pb}: expected W_q dtype {expected_dtype}, got {layer.W_q.dtype}")
+
+                _check_serialization(self, layer)
+
+
+class TestBiasRoundTrip(unittest.TestCase):
+    """Bias must survive a save/load round-trip on both code paths."""
+
+    def _make_layer_with_bias(self):
+        in_features, out_features = 2048, 1024
+        W_nbits, group_size = 4, 128
+        W_q = torch.randint(0, 2**W_nbits - 1, (out_features, in_features), device=device).to(torch.uint8)
+        gs = W_q.numel() // group_size
+        scales = torch.ones((gs, 1), device=device, dtype=compute_dtype) * 0.001
+        zeros  = torch.full((gs, 1), (2**W_nbits - 1) // 2, device=device, dtype=compute_dtype)
+        bias = torch.randn(out_features, dtype=compute_dtype, device=device) * 0.01
+
+        layer = GemLiteLinearTriton(W_nbits,
+                        group_size=group_size,
+                        in_features=in_features,
+                        out_features=out_features,
+                        input_dtype=gemlite_dtype,
+                        output_dtype=gemlite_dtype)
+        layer.pack(W_q, scales, zeros, bias)
+        return layer, in_features
+
+    def test_bias_in_state_dict(self):
+        layer, _ = self._make_layer_with_bias()
+        sd = layer.state_dict()
+        self.assertIn("bias", sd)
+
+    def test_bias_direct_round_trip(self):
+        layer, _ = self._make_layer_with_bias()
+        _check_serialization(self, layer)
+
+    def test_bias_sequential_round_trip(self):
+        layer, in_features = self._make_layer_with_bias()
+        ref = torch.nn.Sequential(layer).to(device)
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        loaded.load_state_dict(torch.load(dummy_file), strict=True)
+
+        self.assertIsNotNone(loaded[0].bias)
+        self.assertTrue(torch.equal(ref[0].bias, loaded[0].bias))
+
+        x = torch.randn(32, in_features, dtype=compute_dtype, device=device) / 10.
+        diff = (ref[0].forward_manual(x, matmul_type='GEMM')
+                - loaded[0].forward_manual(x, matmul_type='GEMM')).abs().mean().item()
+        self.assertTrue(diff < 1e-7, f"Sequential bias round-trip inference mismatch: {diff}")
+
+
+class TestAssignTrueLoad(unittest.TestCase):
+    """HF Diffusers' meta-device path uses load_state_dict(..., assign=True),
+    which tells PyTorch to swap tensor objects rather than copy_ into them.
+    Our _load_from_state_dict already swaps objects via _promote_to_parameter,
+    so this should work identically to the default path."""
+
+    def _make_INT_layer(self):
+        in_features, out_features = 2048, 1024
+        W_nbits, group_size = 4, 128
+        W_q = torch.randint(0, 2**W_nbits - 1, (out_features, in_features), device=device).to(torch.uint8)
+        gs = W_q.numel() // group_size
+        scales = torch.ones((gs, 1), device=device, dtype=compute_dtype) * 0.001
+        zeros  = torch.full((gs, 1), (2**W_nbits - 1) // 2, device=device, dtype=compute_dtype)
+        layer = GemLiteLinearTriton(W_nbits,
+                        group_size=group_size,
+                        in_features=in_features,
+                        out_features=out_features,
+                        input_dtype=gemlite_dtype,
+                        output_dtype=gemlite_dtype)
+        layer.pack(W_q, scales, zeros, None)
+        return layer, in_features
+
+    def test_assign_true_sequential(self):
+        layer, in_features = self._make_INT_layer()
+        ref = torch.nn.Sequential(layer).to(device)
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        loaded.load_state_dict(torch.load(dummy_file), strict=True, assign=True)
+
+        x = torch.randn(32, in_features, dtype=compute_dtype, device=device) / 10.
+        diff = (ref[0].forward_manual(x, matmul_type='GEMM')
+                - loaded[0].forward_manual(x, matmul_type='GEMM')).abs().mean().item()
+        self.assertTrue(diff < 1e-7, f"assign=True Sequential inference mismatch: {diff}")
+
+
+class TestNnSequentialRoundTripMX(unittest.TestCase):
+    """Sequential round-trip for the MXFP/NVFP helper-quantized layers.
+    Helpers post-mutate state after pack() (e.g. A4W4_NVFP_dynamic sets
+    meta_scale as a Parameter; channel_scale_mode=4). The first save must
+    capture those post-pack mutations via _save_to_state_dict's metadata
+    rebuild, and the Sequential load must reproduce them faithfully."""
+
+    def setUp(self):
+        self.in_features, self.out_features = 4224, 2048
+        torch.manual_seed(42)
+        self.linear_layer = torch.nn.Linear(
+            self.in_features, self.out_features, dtype=compute_dtype, device=device, bias=False
+        )
+        self.linear_layer.weight.data /= 10.
+        self.linear_layer.weight.requires_grad = False
+
+    def _quantize(self, processor_fn):
+        model = torch.nn.Sequential(
+            torch.nn.Linear(self.in_features, self.out_features, dtype=compute_dtype, device=device, bias=False)
+        )
+        model.requires_grad_(False)
+        model[0].weight.data = self.linear_layer.weight.data.clone()
+        patch_model(model, device=device, processor=processor_fn(dtype=compute_dtype))
+        return model
+
+    def _run_sequential_round_trip(self, processor_fn, matmul_type='GEMM', batch_size=32, tol=1e-7):
+        ref = self._quantize(processor_fn)
+        torch.save(ref.state_dict(), dummy_file)
+
+        loaded = torch.nn.Sequential(GemLiteLinearTriton()).to(device)
+        loaded.load_state_dict(torch.load(dummy_file), strict=True)
+
+        # post-pack helpers may set meta_scale; verify it survived
+        self.assertEqual(ref[0].meta_scale.dtype, loaded[0].meta_scale.dtype)
+        self.assertTrue(torch.equal(ref[0].meta_scale, loaded[0].meta_scale),
+                        f"meta_scale mismatch ref={ref[0].meta_scale} loaded={loaded[0].meta_scale}")
+
+        x = torch.randn(batch_size, self.in_features, dtype=compute_dtype, device=device) / 10.
+        y_ref = ref[0].forward_manual(x, matmul_type=matmul_type)
+        y_loaded = loaded[0].forward_manual(x, matmul_type=matmul_type)
+        diff = (y_ref - y_loaded).abs().mean().item()
+        self.assertTrue(diff < tol, f"Sequential MX round-trip mismatch ({matmul_type}): diff={diff}")
+
+    def test_A4W4_MXFP_sequential(self):
+        self._run_sequential_round_trip(A4W4_MXFP_dynamic, matmul_type='GEMM')
+        self._run_sequential_round_trip(A4W4_MXFP_dynamic, matmul_type='GEMM_SPLITK', batch_size=2)
+
+    def test_A4W4_NVFP_sequential(self):
+        self._run_sequential_round_trip(A4W4_NVFP_dynamic, matmul_type='GEMM')
+        self._run_sequential_round_trip(A4W4_NVFP_dynamic, matmul_type='GEMM_SPLITK', batch_size=2)
+
+
 if __name__ == '__main__':
     unittest.main()

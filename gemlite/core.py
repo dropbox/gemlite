@@ -353,7 +353,6 @@ class GemLiteLinearTriton(torch.nn.Module):
 
         self.in_features  = in_features
         self.out_features = out_features
-        self.orig_shape   = (out_features, in_features)
         self.W_nbits      = W_nbits
         self.group_size   = group_size
         self.unpack_mask  = 2**self.W_nbits - 1
@@ -364,7 +363,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.output_dtype  = output_dtype
         self.compute_dtype = DTYPE_TO_TORCH[self.input_dtype.value]
         self.meta_dtype    = input_dtype
-        
+
         #Accumulation
         self.acc_dtype = GEMLITE_ACC_DTYPE[self.input_dtype] if(acc_dtype is None) else acc_dtype
 
@@ -374,33 +373,83 @@ class GemLiteLinearTriton(torch.nn.Module):
         else:
             self.scaled_activations = scaled_activations
 
-        #Default forward        
+        #Default forward
         self.forward = self.forward_auto_no_warmup
 
-        #Meta-scale for NVFP4 (0.0 = not used)
-        self.meta_scale = 0.0
+        # Register the serialized checkpoint schema up front so fresh modules
+        # advertise their keys via state_dict() (issue #68). Placeholders are
+        # empty tensors; real dtype/shape come from pack() or load.
+        self.register_buffer("W_q",        torch.empty(0, dtype=torch.uint8))
+        self.register_buffer("scales",     torch.empty(0, dtype=torch.uint8))
+        self.register_buffer("zeros",      torch.empty(0, dtype=torch.int32))
+        self.register_buffer("metadata",   torch.empty(0, dtype=torch.int32))
+        self.register_buffer("orig_shape", torch.empty(0, dtype=torch.int32))
+        self.register_buffer("meta_scale", torch.tensor(0.0, dtype=torch.float32))
+        # bias mirrors nn.Linear: key appears in state_dict only when populated.
+        self.register_parameter("bias", None)
+
+    # Schema slots registered in __init__ are buffers (or a None parameter for
+    # bias). nn.Module enforces slot types in __setattr__, so intermediate
+    # assignments like `self.zeros = int(...)` or `self.bias = tensor.to(...)`
+    # inside pack() would raise TypeError. _clear_pack_slots drops these
+    # four (which pack() reassigns mid-body) so the body can stash plain
+    # Python values; _promote_to_parameter re-registers them at the end.
+    _PACK_MUTATED_NAMES = ("W_q", "scales", "zeros", "bias")
+
+    def _clear_pack_slots(self):
+        for name in self._PACK_MUTATED_NAMES:
+            self._clear_slot(name)
+
+    def _clear_slot(self, name):
+        # Remove a name from any storage (buffer, parameter, plain __dict__
+        # entry) before re-registering it.
+        self._buffers.pop(name, None)
+        self._parameters.pop(name, None)
+        self.__dict__.pop(name, None)
+
+    def _promote_to_parameter(self, name, tensor):
+        self._clear_slot(name)
+        self.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=False))
+
+    def _register_none_param(self, name):
+        # nn.Linear-style: name appears in state_dict() only when populated.
+        self._clear_slot(name)
+        self.register_parameter(name, None)
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         # Rebuild metadata from live attributes to ensure consistency
-        # (helpers may override channel_scale_mode/W_group_mode after pack())
-        if hasattr(self, 'metadata') and self.metadata is not None and hasattr(self, 'W_nbits'):
-            self.metadata = torch.nn.Parameter(
-                torch.tensor(self.get_meta_args(), device=self.W_q.device if isinstance(self.W_q, (torch.Tensor, torch.nn.Parameter)) else 'cpu', dtype=torch.int32),
-                requires_grad=False,
+        # (helpers may override channel_scale_mode/W_group_mode after pack()).
+        # Skip on fresh modules where W_q is still an empty placeholder.
+        if (self.W_q is not None and isinstance(self.W_q, torch.Tensor)
+                and self.W_q.numel() > 0 and hasattr(self, 'W_nbits')):
+            _device = self.W_q.device
+            self._promote_to_parameter(
+                "metadata",
+                torch.tensor(self.get_meta_args(), device=_device, dtype=torch.int32),
             )
         super()._save_to_state_dict(destination, prefix, keep_vars)
 
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        self.W_q        = state_dict.pop("W_q", None)
-        self.bias       = state_dict.pop("bias", None)
-        self.scales     = state_dict.pop("scales", None)
-        self.zeros      = state_dict.pop("zeros", None)
-        self.metadata   = state_dict.pop("metadata", None)
-        self.orig_shape = state_dict.pop("orig_shape", None)
-        _meta_scale     = state_dict.pop("meta_scale", None)
+    def _apply_state_dict(self, sd):
+        """Parse a (short-keyed) checkpoint dict and populate this module.
+        Shared by load_state_dict() and _load_from_state_dict() so both code
+        paths produce identical state."""
+        W_q        = sd.get("W_q",        None)
+        bias       = sd.get("bias",       None)
+        scales     = sd.get("scales",     None)
+        zeros      = sd.get("zeros",      None)
+        metadata   = sd.get("metadata",   None)
+        orig_shape = sd.get("orig_shape", None)
+        _meta_scale = sd.get("meta_scale", None)
 
-        self.metadata   = [v.item() for v in self.metadata]
-        self.orig_shape = tuple(v.item() for v in self.orig_shape)
+        if metadata is None or orig_shape is None or W_q is None:
+            raise RuntimeError(
+                "GemLite checkpoint is missing required keys "
+                "(W_q / metadata / orig_shape). "
+                f"Got keys: {sorted(sd.keys())}"
+            )
+
+        metadata_list = [v.item() for v in metadata]
+        orig_shape_t  = tuple(v.item() for v in orig_shape)
 
         (self.scaled_activations,
         self.W_nbits,
@@ -413,7 +462,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.meta_dtype,
         self.channel_scale_mode,
         self.W_group_mode,
-        self.data_contiguous) = self.metadata
+        self.data_contiguous) = metadata_list
 
         self.input_dtype  = DType(self.input_dtype)
         self.output_dtype = DType(self.output_dtype)
@@ -422,46 +471,87 @@ class GemLiteLinearTriton(torch.nn.Module):
 
         # Restore meta_scale with backward compat for old checkpoints
         if _meta_scale is not None:
-            self.meta_scale = _meta_scale.float()
+            meta_scale_val = _meta_scale.float() if isinstance(_meta_scale, torch.Tensor) else float(_meta_scale)
         else:
-            self.meta_scale = 0.05 if self.input_dtype == DType.NVFP4 else 0.0  # backward compat default for old checkpoints
+            meta_scale_val = 0.05 if self.input_dtype == DType.NVFP4 else 0.0
 
-        self.out_features, self.in_features = self.orig_shape
+        self.out_features, self.in_features = orig_shape_t
         self.compute_dtype = DTYPE_TO_TORCH[self.input_dtype.value]
         self.scaled_activations = bool(self.scaled_activations)
         self.data_contiguous = bool(self.data_contiguous)
-        
-        # Backward compat: pop stale scales_5d from old saves
-        state_dict.pop("scales_5d", None)
-        # Convert 2D scales to 5D TMA layout for MX dtypes
-        if is_mx_dtype(self.input_dtype) and self.scales is not None:
-            s = self.scales.data if isinstance(self.scales, torch.nn.Parameter) else self.scales
-            if s.ndim == 2:
-                s_2d = s.contiguous()  # [N, K_S] contiguous (matches pack's self.scales.T.contiguous())
-                N_dim, K_S = s_2d.shape[0], s_2d.shape[1]
-                if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N_dim % 128 == 0 and K_S % 4 == 0:
-                    self.scales = s_2d.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
 
-        # Re-register tensors as nn.Parameter for proper state_dict / .to() / .parameters() support
-        _device = self.W_q.device
-        self.W_q = torch.nn.Parameter(self.W_q, requires_grad=False)
-        self.bias = torch.nn.Parameter(self.bias, requires_grad=False) if self.bias is not None else None
-        self.scales = torch.nn.Parameter(self.scales, requires_grad=False)
-        self.zeros = torch.nn.Parameter(self.zeros, requires_grad=False)
-        self.metadata = torch.nn.Parameter(
+        # Convert 2D MX scales to 5D TMA layout if needed
+        if is_mx_dtype(self.input_dtype) and scales is not None and scales.ndim == 2:
+            s_2d = scales.contiguous()  # [N, K_S]
+            N_dim, K_S = s_2d.shape[0], s_2d.shape[1]
+            if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N_dim % 128 == 0 and K_S % 4 == 0:
+                scales = s_2d.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
+
+        # Promote tensors from buffers to Parameters (preserves prior contract).
+        _device = W_q.device
+        self._promote_to_parameter("W_q", W_q)
+        if bias is not None:
+            self._promote_to_parameter("bias", bias)
+        else:
+            # nn.Linear-style: bias key absent from state_dict unless populated.
+            self._register_none_param("bias")
+        self._promote_to_parameter("scales", scales)
+        self._promote_to_parameter("zeros",  zeros)
+        self._promote_to_parameter(
+            "metadata",
             torch.tensor(self.get_meta_args(), device=_device, dtype=torch.int32),
-            requires_grad=False,
         )
-        self.orig_shape = torch.nn.Parameter(
+        self._promote_to_parameter(
+            "orig_shape",
             torch.tensor([self.out_features, self.in_features], device=_device, dtype=torch.int32),
-            requires_grad=False,
         )
-        if not isinstance(self.meta_scale, torch.nn.Parameter):
-            _ms = self.meta_scale.item() if isinstance(self.meta_scale, torch.Tensor) else float(self.meta_scale)
-            self.meta_scale = torch.nn.Parameter(
-                torch.tensor(_ms, device=_device, dtype=torch.float32),
-                requires_grad=False,
-            )
+        _ms = meta_scale_val.item() if isinstance(meta_scale_val, torch.Tensor) else float(meta_scale_val)
+        self._promote_to_parameter(
+            "meta_scale",
+            torch.tensor(_ms, device=_device, dtype=torch.float32),
+        )
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # Backward-compat path: existing callers passing the raw checkpoint dict
+        # directly. Pop GemLite keys (and the stale scales_5d from old saves).
+        sd = {
+            "W_q":        state_dict.pop("W_q",        None),
+            "bias":       state_dict.pop("bias",       None),
+            "scales":     state_dict.pop("scales",     None),
+            "zeros":      state_dict.pop("zeros",      None),
+            "metadata":   state_dict.pop("metadata",   None),
+            "orig_shape": state_dict.pop("orig_shape", None),
+            "meta_scale": state_dict.pop("meta_scale", None),
+        }
+        state_dict.pop("scales_5d", None)
+        self._apply_state_dict(sd)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Path taken by standard PyTorch loaders (HF Diffusers, nn.Sequential,
+        # etc.) when load_state_dict() is called on a parent module. Our
+        # placeholders have shape/dtype that don't match the real checkpoint
+        # tensors, so we extract our keys here and delegate to _apply_state_dict
+        # instead of letting nn.Module's default copy_-based loader run.
+        sd = {}
+        keys = ("W_q", "bias", "scales", "zeros", "metadata", "orig_shape", "meta_scale")
+        for k in keys:
+            full = prefix + k
+            if full in state_dict:
+                sd[k] = state_dict.pop(full)
+        # Backward compat: pop stale scales_5d from old saves
+        state_dict.pop(prefix + "scales_5d", None)
+
+        if "W_q" not in sd:
+            # Nothing GemLite-shaped here; let super handle missing-key reporting.
+            super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                          missing_keys, unexpected_keys, error_msgs)
+            return
+
+        try:
+            self._apply_state_dict(sd)
+        except Exception as e:
+            error_msgs.append(f"GemLite load error at prefix '{prefix}': {e}")
 
 
 
@@ -476,7 +566,12 @@ class GemLiteLinearTriton(torch.nn.Module):
         contiguous: Union[int, None] = None,
         packing_bitwidth: Union[int, None] = None,
         packed: bool = False,
-    ):  
+    ):
+
+        # Drop slots that pack() reassigns mid-body so intermediate writes
+        # (e.g. self.zeros = int(zeros), self.bias = tensor) aren't rejected
+        # by nn.Module's typed setattr. Re-registered at the end of pack().
+        self._clear_pack_slots()
 
         #Check inputs
         raise_unsupported = False
@@ -529,7 +624,7 @@ class GemLiteLinearTriton(torch.nn.Module):
             _pack_weights_over_cols = pack_weights_over_cols_triton if (W_q.device.type == "cuda") else pack_weights_over_cols_torch
 
             self.W_q, self.elements_per_sample = _pack_weights_over_cols(
-                W_q.view(self.orig_shape),
+                W_q.view((self.out_features, self.in_features)),
                 W_nbits=self.W_nbits,
                 packing_bitwidth=packing_bitwidth,
                 transpose=True,
@@ -663,27 +758,38 @@ class GemLiteLinearTriton(torch.nn.Module):
         if(self.scales is not None):
             self.meta_dtype = TORCH_TO_DTYPE[self.scales.dtype]
 
-        #Register tensors as buffers
-        self.W_q = torch.nn.Parameter(self.W_q, requires_grad=False)
-        self.bias = torch.nn.Parameter(self.bias, requires_grad=False) if self.bias is not None else None
-        self.scales = torch.nn.Parameter(self.scales,requires_grad=False)
-        self.zeros  = torch.nn.Parameter(self.zeros, requires_grad=False)
+        # Register schema entries as Parameters (slots were demoted at the top
+        # of pack()). Plain Python values were assigned above; now formalize.
+        _W_q, _scales, _zeros = self.W_q, self.scales, self.zeros
+        _bias = self.bias
+        self._promote_to_parameter("W_q",    _W_q)
+        self._promote_to_parameter("scales", _scales)
+        self._promote_to_parameter("zeros",  _zeros)
+        if _bias is not None:
+            self._promote_to_parameter("bias", _bias)
+        else:
+            self._register_none_param("bias")
 
         #Register metadata
-        self.metadata = torch.nn.Parameter(
+        self._promote_to_parameter(
+            "metadata",
             torch.tensor(self.get_meta_args(), device=self.device, dtype=torch.int32),
-            requires_grad=False,
         )
-        
-        self.orig_shape = torch.nn.Parameter(
+        self._promote_to_parameter(
+            "orig_shape",
             torch.tensor([self.out_features, self.in_features], device=self.device, dtype=torch.int32),
-            requires_grad=False,
         )
-        
 
-        self.meta_scale = torch.nn.Parameter(
-            torch.tensor(self.meta_scale, device=self.device, dtype=torch.float32),
-            requires_grad=False,
+        # self.meta_scale may currently be a buffer (fresh) or a Parameter set
+        # by a helper (e.g. A4W4_NVFP_dynamic) - normalize to a fp32 Parameter.
+        _ms = self.meta_scale
+        if isinstance(_ms, torch.Tensor):
+            _ms_val = float(_ms.item())
+        else:
+            _ms_val = float(_ms)
+        self._promote_to_parameter(
+            "meta_scale",
+            torch.tensor(_ms_val, device=self.device, dtype=torch.float32),
         )
 
         return self
